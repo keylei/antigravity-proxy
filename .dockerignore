@@ -1,0 +1,81 @@
+# Antigravity Proxy - Docker 构建忽略文件
+#
+# 这些文件/目录不会被复制到 Docker 镜像中，
+# 可以加快构建速度并减小镜像体积。
+
+# ============ Git 相关 ============
+.git
+.gitignore
+.github
+
+# ============ 依赖目录 ============
+node_modules
+*/node_modules
+**/node_modules
+
+# ============ 数据与日志 ============
+data
+*.log
+*.sqlite
+*.sqlite-journal
+
+# ============ 环境配置 ============
+.env
+.env.local
+.env.*.local
+
+# ============ IDE 与编辑器 ============
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# ============ 系统文件 ============
+.DS_Store
+Thumbs.db
+
+# ============ 文档与测试 ============
+docs
+*.md
+!backend/README.md
+*.test.js
+*.spec.js
+__tests__
+coverage
+.nyc_output
+
+# ============ Docker 相关 ============
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# ============ 临时文件 ============
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# ============ 构建产物 ============
+dist
+build
+*.tgz
+*.tar.gz
+*.zip
+.agp-cache
+
+# ============ 构建脚本 ============
+scripts/build.js
+
+# ============ TLS 指纹（仅保留 linux 二进制） ============
+backend/src/bin/fingerprint-src
+backend/src/bin/fingerprint_windows_amd64.exe
+backend/src/bin/fingerprint_darwin_amd64
+backend/src/bin/fingerprint_darwin_arm64
+
+# ============ 截图等杂项 ============
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico

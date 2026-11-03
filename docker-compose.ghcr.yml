@@ -1,0 +1,124 @@
+# Antigravity Proxy - 预构建镜像 Docker Compose 配置
+#
+# 用法:
+#   启动: docker-compose -f docker-compose.ghcr.yml up -d
+#   停止: docker-compose -f docker-compose.ghcr.yml down
+#   查看日志: docker-compose -f docker-compose.ghcr.yml logs -f
+#   更新镜像: docker-compose -f docker-compose.ghcr.yml pull && docker-compose -f docker-compose.ghcr.yml up -d
+#
+# 配置方式: 直接修改下方 environment 中的值
+#
+# 注意: 标记为【必改】的配置项请务必修改为你自己的值！
+
+services:
+  app:
+    image: ghcr.io/kazuki-0147/antigravity-proxy:latest
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    user: root
+    volumes:
+      - ./data:/app/data
+    ports:
+      # 宿主机端口:容器端口（修改冒号前的数字来更改访问端口）
+      - "8088:3000"
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3000
+      - DB_PATH=/app/data/database.sqlite
+
+      # ============ 基础配置【必改】 ============
+      # API 访问密钥（客户端调用 API 时需要提供，留空则无需密钥）
+      - API_KEY=
+      # 管理面板密码【必改】
+      - ADMIN_PASSWORD=
+      # JWT 签名密钥（用于管理面板登录态）【必改】建议设置为随机字符串
+      - JWT_SECRET=
+
+      # ============ 可选配置 ============
+      # 上游官方系统提示词（留空则使用内置默认值）
+      - OFFICIAL_SYSTEM_PROMPT=
+      # 允许使用 ADMIN_PASSWORD 作为 Bearer Token（生产环境建议关闭）
+      - ADMIN_PASSWORD_BEARER_COMPAT=false
+
+      # ============ 并发与重试配置 ============
+      # 禁用本地并发限制（1=禁用，0=启用）
+      - DISABLE_LOCAL_LIMITS=1
+      # 每个模型的最大并发请求数（0=不限制）
+      - MAX_CONCURRENT_PER_MODEL=0
+      # 每个账号的最大并发请求数（0=不限制）
+      - MAX_CONCURRENT_PER_ACCOUNT=0
+      # 上游容量错误重试延迟（毫秒）
+      - UPSTREAM_CAPACITY_RETRY_DELAY_MS=1000
+      # 同号重试次数（非容量错误时，在换号前先重试几次）
+      - SAME_ACCOUNT_RETRIES=3
+      # 同号重试延迟（毫秒）
+      - SAME_ACCOUNT_RETRY_DELAY_MS=500
+      # 连续失败多少次才禁用账号（防止偶发错误导致账号被禁）
+      - ERROR_COUNT_TO_DISABLE=3
+      # 重试总超时时间（毫秒）
+      - RETRY_TOTAL_TIMEOUT_MS=30000
+      # 容量冷却默认时间（毫秒）
+      - CAPACITY_COOLDOWN_DEFAULT_MS=15000
+      # 容量冷却最大时间（毫秒）
+      - CAPACITY_COOLDOWN_MAX_MS=120000
+
+      # ============ 网络代理配置 ============
+      # 出站 HTTP(S) 代理（解决部分网络环境下 OAuth/Token 刷新超时问题，留空则不使用代理）
+      - OUTBOUND_PROXY=
+      # fetch 连接超时（毫秒）
+      - FETCH_CONNECT_TIMEOUT_MS=30000
+
+      # ============ 工具调用配置 ============
+      # tool_result 单条最大字符数（0=不限制）
+      - TOOL_RESULT_MAX_CHARS=0
+      # tool_result 总计最大字符数（0=不限制）
+      - TOOL_RESULT_TOTAL_MAX_CHARS=0
+      # 截断时保留尾部字符数
+      - TOOL_RESULT_TAIL_CHARS=1200
+      # 是否记录截断日志
+      - TOOL_RESULT_TRUNCATE_LOG=false
+      # 工具调用时的最大输出 tokens（0=不限制）
+      - MAX_OUTPUT_TOKENS_WITH_TOOLS=0
+
+      # ============ Claude 思考签名缓存 ============
+      # 签名缓存过期时间（毫秒），默认 24 小时
+      - CLAUDE_THINKING_SIGNATURE_TTL_MS=86400000
+      # 签名缓存最大条目数
+      - CLAUDE_THINKING_SIGNATURE_MAX=5000
+      # 用户最后签名缓存过期时间（毫秒），默认 24 小时
+      - CLAUDE_LAST_SIGNATURE_TTL_MS=86400000
+      # 用户最后签名缓存最大条目数
+      - CLAUDE_LAST_SIGNATURE_MAX=50000
+      # Gemini 工具签名缓存过期时间（毫秒），默认 10 分钟
+      - TOOL_THOUGHT_SIGNATURE_TTL_MS=600000
+      # Gemini 工具签名缓存最大条目数
+      - TOOL_THOUGHT_SIGNATURE_MAX=5000
+      # OpenAI 端点回放签名时是否包含思考内容
+      - CLAUDE_OPENAI_REPLAY_THOUGHT_TEXT=true
+
+      # ============ Claude 扩展思考流配置 ============
+      - ANTHROPIC_SSE_DEFER_NON_THINKING_MS=300
+      - ANTHROPIC_SSE_DEFER_NON_THINKING_CHUNKS=2
+      # 空思考块处理模式：emit（发送）| redacted（标记已编辑）| suppress（抑制）
+      - ANTHROPIC_SSE_EMPTY_THINKING_MODE=suppress
+
+      # ============ 其他配置 ============
+      # 仪表盘「今日」统计时区偏移（分钟），中国时间为 480
+      - DASHBOARD_TZ_OFFSET_MINUTES=480
+
+      # ============ 调试配置（默认关闭） ============
+      # 捕获上游请求（1=开启，0=关闭）
+      - UPSTREAM_REQUEST_CAPTURE=0
+      - UPSTREAM_REQUEST_CAPTURE_PATH=/app/data/upstream_requests.log
+      # 捕获上游 SSE 响应（1=开启，0=关闭）
+      - UPSTREAM_SSE_CAPTURE=0
+      - UPSTREAM_SSE_CAPTURE_PATH=/app/data/upstream_sse.log
+      # 调试思考流程（1=开启，0=关闭）
+      - DEBUG_THINKING_FLOW=0
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

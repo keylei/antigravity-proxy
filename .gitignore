@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+
+# runtime data
+data/
+*.sqlite
+*.sqlite-*
+*.db
+
+# node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# builds
+# (frontend/dist is committed to make first `npm start` fast; rebuild with `npm run -w frontend build` when changing UI)
+dist/
+.agp-cache/
+
+# local caches
+.npm-cache/
+.cache/

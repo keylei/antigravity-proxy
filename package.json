@@ -1,0 +1,24 @@
+{
+  "name": "antigravity-proxy-monolith",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "build:bin": "node scripts/build.js",
+    "build:linux-x64": "node scripts/build.js --target linux-x64",
+    "build:linux-arm64": "node scripts/build.js --target linux-arm64",
+    "build:win-x64": "node scripts/build.js --target win-x64",
+    "build:macos-x64": "node scripts/build.js --target macos-x64",
+    "build:macos-arm64": "node scripts/build.js --target macos-arm64"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.2",
+    "pkg": "^5.8.1"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  }
+}
