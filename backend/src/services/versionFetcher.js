@@ -40,7 +40,12 @@ async function checkAndUpdate() {
         const current = getAgVersion();
         if (latest !== current) {
             setAgVersion(latest);
-            console.log(`[VersionFetcher] 版本更新: ${current} -> ${latest}`);
+            const applied = getAgVersion();
+            if (applied !== current) {
+                console.log(`[VersionFetcher] 版本更新: ${current} -> ${applied}`);
+            } else {
+                console.log(`[VersionFetcher] 远端版本 ${latest} 低于下限，保持 ${current}`);
+            }
         }
     } catch (err) {
         console.warn(`[VersionFetcher] 获取版本失败: ${err.message}`);

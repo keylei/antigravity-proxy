@@ -32,8 +32,8 @@ class App {
     // 初始化主题
     await commands.dispatch('theme:init');
 
-    // 检查登录状态
-    const isLoggedIn = await commands.dispatch('auth:check');
+    // 管理面板已取消密码登录，直接以 admin 身份进入
+    await commands.dispatch('auth:check');
 
     // 监听用户状态变化
     store.subscribe('user', (user) => {
@@ -45,13 +45,9 @@ class App {
       this._handleTabChange(tab);
     });
 
-    // 初始渲染
-    if (isLoggedIn) {
-      this._renderShell();
-      await commands.dispatch('nav:change', { tab: 'dashboard' });
-    } else {
-      this._renderLogin();
-    }
+    // 直接渲染应用外壳，无需登录
+    this._renderShell();
+    await commands.dispatch('nav:change', { tab: 'dashboard' });
   }
 
   /**

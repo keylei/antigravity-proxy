@@ -45,7 +45,18 @@ export function initDatabase(options = {}) {
     // 迁移：添加设备指纹字段
     migrateDeviceIdentityColumns(db);
 
+    // 迁移：添加 AI 积分字段
+    migrateCreditsColumn(db);
+
     return db;
+}
+
+function migrateCreditsColumn(db) {
+    const columns = new Set(db.prepare("PRAGMA table_info(accounts)").all().map(c => c.name));
+    if (!columns.has('ai_credits')) {
+        // JSON 数组：loadCodeAssist 返回的 paidTier.availableCredits
+        db.exec('ALTER TABLE accounts ADD COLUMN ai_credits TEXT');
+    }
 }
 
 function migrateEmailNullable(db) {
@@ -96,7 +107,7 @@ export function getDatabase() {
 export function getAllAccounts() {
     return getDatabase().prepare(`
         SELECT id, email, status, tier, quota_remaining, quota_reset_time,
-               last_used_at, error_count, last_error, created_at,
+               last_used_at, error_count, last_error, created_at, ai_credits,
                CASE WHEN token_expires_at > ? THEN 1 ELSE 0 END as token_valid
         FROM accounts ORDER BY created_at DESC
     `).all(Date.now());
@@ -159,6 +170,48 @@ export function upsertAccountModelQuota(accountId, model, quotaRemaining, quotaR
             quota_reset_time = excluded.quota_reset_time,
             updated_at = excluded.updated_at
     `).run(accountId, model, quotaRemaining, quotaResetTime, Date.now());
+}
+
+export function upsertAccountQuotaBucket(accountId, groupId, bucketId, remainingFraction, resetTime) {
+    if (!accountId || !groupId || !bucketId) return;
+    getDatabase().prepare(`
+        INSERT INTO account_quota_buckets
+            (account_id, group_id, bucket_id, remaining_fraction, reset_time, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id, group_id, bucket_id) DO UPDATE SET
+            remaining_fraction = excluded.remaining_fraction,
+            reset_time = excluded.reset_time,
+            updated_at = excluded.updated_at
+    `).run(accountId, groupId, bucketId, remainingFraction, resetTime, Date.now());
+}
+
+export function getAccountQuotaBuckets(accountId) {
+    return getDatabase().prepare(`
+        SELECT group_id, bucket_id, remaining_fraction, reset_time, updated_at
+        FROM account_quota_buckets WHERE account_id = ? ORDER BY group_id, bucket_id
+    `).all(accountId);
+}
+
+// 无可用账号时的诊断：列出每个账号在该模型上的状态与配额
+export function getModelAvailabilityRows(model) {
+    return getDatabase().prepare(`
+        SELECT a.id, a.email, a.status, q.quota_remaining, q.quota_reset_time
+        FROM accounts a
+        LEFT JOIN account_model_quotas q ON q.account_id = a.id AND q.model = ?
+    `).all(model);
+}
+
+// 账号列表用：一次取出所有账号的额度分组，避免逐账号查询
+export function getAllQuotaBuckets() {
+    return getDatabase().prepare(`
+        SELECT account_id, group_id, bucket_id, remaining_fraction, reset_time, updated_at
+        FROM account_quota_buckets ORDER BY account_id, group_id, bucket_id
+    `).all();
+}
+
+export function updateAccountCredits(id, credits) {
+    const value = Array.isArray(credits) ? JSON.stringify(credits) : null;
+    getDatabase().prepare('UPDATE accounts SET ai_credits = ? WHERE id = ?').run(value, id);
 }
 
 export function getAccountById(id) {
@@ -224,8 +277,9 @@ export function deleteAccount(id) {
     // 先将关联的日志记录的 account_id 设为 NULL
     db.prepare('UPDATE request_logs SET account_id = NULL WHERE account_id = ?').run(id);
     db.prepare('UPDATE request_attempt_logs SET account_id = NULL WHERE account_id = ?').run(id);
-    // 删除账号-模型配额记录
+    // 删除账号-模型配额与配额桶记录
     db.prepare('DELETE FROM account_model_quotas WHERE account_id = ?').run(id);
+    db.prepare('DELETE FROM account_quota_buckets WHERE account_id = ?').run(id);
     // 然后删除账号
     db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
 }

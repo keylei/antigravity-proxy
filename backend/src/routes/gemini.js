@@ -414,8 +414,10 @@ export default async function geminiRoutes(fastify) {
                     accountPool.markAccountError(account.id, error);
                 }
 
-                const httpStatus = capacity ? 429 : (authError ? 401 : 500);
-                const errorCode = capacity ? 'rate_limit_exceeded' : (authError ? 'invalid_api_key' : 'internal_error');
+                // 没有任何账号支持该模型：返回 404，避免被误认为服务端故障
+                const notAvailable = error?.code === 'model_not_available';
+                const httpStatus = capacity ? 429 : (authError ? 401 : (notAvailable ? 404 : 500));
+                const errorCode = capacity ? 'rate_limit_exceeded' : (authError ? 'invalid_api_key' : (notAvailable ? 'model_not_found' : 'internal_error'));
                 if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {
                     reply.header('Retry-After', Math.max(0, Math.ceil(retryAfterMs / 1000)));
                 }

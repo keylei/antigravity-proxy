@@ -5,10 +5,11 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 
-import { SERVER_CONFIG } from './config.js';
+import { SERVER_CONFIG, assertOAuthConfig } from './config.js';
 import { initDatabase } from './db/index.js';
 import { startTokenRefreshScheduler, startQuotaSyncScheduler, startLogCleanupScheduler, getAllActiveAccounts } from './services/tokenManager.js';
 import { configureGlobalFetchDispatcher } from './runtime/fetch-dispatcher.js';
+import { startDirectFailoverTunnel } from './runtime/direct-dialer.js';
 import { resolveRuntimePath } from './runtime/paths.js';
 import { startUnleashScheduler } from './services/unleash.js';
 import { startAllHeartbeats } from './services/warmup.js';
@@ -34,6 +35,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * @returns {Promise<import('fastify').FastifyInstance>}
  */
 export async function startServer(options = {}) {
+    // OAuth 凭据缺失时直接拒绝启动，避免账号被批量标记为 error
+    assertOAuthConfig();
+
+    // 未配置出站代理时（直连 / TUN 模式），启动多 IP 容错隧道，避开握手失败的 Google IP
+    await startDirectFailoverTunnel();
+
     // 配置全局 fetch dispatcher（代理、超时等）
     configureGlobalFetchDispatcher();
 

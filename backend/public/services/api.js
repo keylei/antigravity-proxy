@@ -248,6 +248,18 @@ class ApiService {
     });
   }
 
+  async getSettings() {
+    return this.request('/admin/settings');
+  }
+
+  /** 指定所有请求固定使用某个账号；id=null 取消指定 */
+  async setPinnedAccount(id, strict = true) {
+    return this.request('/admin/pinned-account', {
+      method: 'PUT',
+      body: { id, strict }
+    });
+  }
+
 async createAccount(email, refreshToken, projectId = null) {
     return this.request('/admin/accounts', {
       method: 'POST',

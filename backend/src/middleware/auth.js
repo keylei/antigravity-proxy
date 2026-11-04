@@ -1,6 +1,3 @@
-import { SERVER_CONFIG } from '../config.js';
-import { verifyToken } from '../routes/auth.js';
-
 /**
  * API Key 认证中间件
  * 支持两种认证方式：
@@ -90,52 +87,10 @@ export async function verifyApiKey(request, reply) {
 
 /**
  * 管理员认证中间件
- * 支持 JWT token、密码直接验证、Basic auth
+ * 已按需求关闭：管理面板不再要求密码/token，直接放行并赋予 admin 身份
  */
 export async function verifyAdmin(request, reply) {
-    const authHeader = request.headers.authorization;
-
-    if (!authHeader) {
-        return reply.code(401).send({
-            error: { message: 'Missing Authorization header' }
-        });
-    }
-
-    if (authHeader.startsWith('Bearer ')) {
-        const token = authHeader.slice(7);
-
-        // 1. 首先尝试验证 JWT
-        const decoded = verifyToken(token);
-        if (decoded && decoded.role === 'admin') {
-            request.user = decoded;
-            return; // JWT 验证成功
-        }
-
-        // 2. 兼容旧方式：直接使用密码作为 token（可通过环境变量关闭）
-        if (SERVER_CONFIG.admin_password_bearer_compat && token === SERVER_CONFIG.admin_password) {
-            request.user = { sub: 'admin', role: 'admin' };
-            return;
-        }
-
-        return reply.code(401).send({
-            error: { message: 'Invalid token' }
-        });
-    } else if (authHeader.startsWith('Basic ')) {
-        const base64 = authHeader.slice(6);
-        const decoded = Buffer.from(base64, 'base64').toString('utf-8');
-        const [username, password] = decoded.split(':');
-
-        if (username !== 'admin' || password !== SERVER_CONFIG.admin_password) {
-            return reply.code(401).send({
-                error: { message: 'Invalid admin credentials' }
-            });
-        }
-        request.user = { sub: 'admin', role: 'admin' };
-    } else {
-        return reply.code(401).send({
-            error: { message: 'Invalid Authorization header format' }
-        });
-    }
+    request.user = { sub: 'admin', role: 'admin' };
 }
 
 // API Keys 已移除：不再提供 recordApiKeyUsage

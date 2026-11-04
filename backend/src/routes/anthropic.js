@@ -346,8 +346,10 @@ export default async function anthropicRoutes(fastify) {
                 accountPool.markAccountError(account.id, error);
             }
 
-            const httpStatus = capacity ? 429 : (authError ? 401 : 500);
-            const errorType = capacity ? 'rate_limit_error' : (authError ? 'authentication_error' : 'api_error');
+            // 没有任何账号支持该模型：返回 404，避免被误认为服务端故障
+            const notAvailable = error?.code === 'model_not_available';
+            const httpStatus = capacity ? 429 : (authError ? 401 : (notAvailable ? 404 : 500));
+            const errorType = capacity ? 'rate_limit_error' : (authError ? 'authentication_error' : (notAvailable ? 'not_found_error' : 'api_error'));
 
             // 返回 Anthropic 格式的错误
             if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {

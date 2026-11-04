@@ -1,5 +1,5 @@
-import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel, isImageGenerationModel } from '../config.js';
-import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, updateAccountEmail, getAllAccountsForRefresh, upsertAccountModelQuota, getAccountByEmail, deleteAccount, cleanupOldLogs } from '../db/index.js';
+import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel, isImageGenerationModel, getAgVersion } from '../config.js';
+import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, updateAccountEmail, getAllAccountsForRefresh, upsertAccountModelQuota, upsertAccountQuotaBucket, getAccountByEmail, getAccountById, deleteAccount, cleanupOldLogs, updateAccountCredits } from '../db/index.js';
 import { fingerprintFetch } from '../runtime/fingerprint-requester.js';
 import { ensureDeviceIdentity } from './deviceIdentity.js';
 import { runWarmupSequence, startHeartbeat, updateHeartbeatAccount } from './warmup.js';
@@ -7,6 +7,30 @@ import { getDatabase } from '../db/index.js';
 
 // Token 刷新提前时间（5分钟）
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000;
+const QUOTA_SUMMARY_ENDPOINTS = [
+    'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary',
+    `${ANTIGRAVITY_CONFIG.base_url}/v1internal:retrieveUserQuotaSummary`
+];
+
+// retrieveUserQuotaSummary 按 User-Agent 版本决定返回哪些分组：
+// 2.0.0 只返回 Claude 组，>= 2.25.0 才同时返回 Gemini 组（2026-11-03 实测）
+const QUOTA_SUMMARY_MIN_VERSION = '2.25.0';
+
+function compareVersions(a, b) {
+    const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+    const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d !== 0) return d;
+    }
+    return 0;
+}
+
+function quotaSummaryUserAgent() {
+    const current = getAgVersion();
+    const version = compareVersions(current, QUOTA_SUMMARY_MIN_VERSION) >= 0 ? current : QUOTA_SUMMARY_MIN_VERSION;
+    return `antigravity/${version} windows/amd64`;
+}
 
 // Singleflight: 防止同一账号并发刷新 token (key: accountId -> Promise)
 const refreshInFlight = new Map();
@@ -24,6 +48,29 @@ function toQuotaFraction(value, fallback = 0) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 仅这些错误原因允许在 token 刷新成功后自动恢复为 active；
+// 其他原因（如 "Auth permanently invalid"、"Auth error persists after refresh"）保持原样。
+// 'fetch failed' 为旧版本把网络失败误标为账号异常留下的记录，刷新成功后同样恢复
+const RECOVERABLE_TOKEN_ERROR_PREFIXES = ['Token refresh failed', 'fetch failed'];
+
+function isRecoverableTokenError(account) {
+    if (!account || account.status !== 'error') return false;
+    const lastError = String(account.last_error || '');
+    return RECOVERABLE_TOKEN_ERROR_PREFIXES.some(prefix => lastError.startsWith(prefix));
+}
+
+function recoverFromTokenRefreshError(account) {
+    try {
+        const latest = getAccountById(account.id);
+        if (!isRecoverableTokenError(latest)) return;
+        updateAccountStatus(account.id, 'active');
+        account.status = 'active';
+        console.log(`[TokenManager] account ${account.id} (${account.email}) recovered to active after token refresh`);
+    } catch (error) {
+        console.error(`[TokenManager] recover account ${account.id} failed:`, error.message);
+    }
 }
 
 /**
@@ -54,6 +101,9 @@ export async function refreshAccessToken(account) {
         // 更新数据库
         updateAccountToken(account.id, data.access_token, data.expires_in);
 
+        // 之前因 token 刷新失败被标记为 error 的账号，刷新成功后自动恢复
+        recoverFromTokenRefreshError(account);
+
         // 同步更新 heartbeat 中的 account 引用
         account.access_token = data.access_token;
         updateHeartbeatAccount(account);
@@ -63,7 +113,13 @@ export async function refreshAccessToken(account) {
             expires_in: data.expires_in
         };
     } catch (error) {
-        updateAccountStatus(account.id, 'error', error.message);
+        // 网络层失败（代理断开、DNS/TLS 失败等，拿不到 HTTP 响应）不是账号问题，不标记账号异常；
+        // 只有 Google 明确返回了错误（"Token refresh failed: <status> ..."）才标记
+        if (String(error?.message || '').startsWith('Token refresh failed')) {
+            updateAccountStatus(account.id, 'error', error.message);
+        } else {
+            console.warn(`[TokenManager] account ${account.id} (${account.email}) token refresh network error: ${error.message}`);
+        }
         throw error;
     }
 }
@@ -363,6 +419,16 @@ export async function fetchQuotaInfo(account, model = null) {
             }
         }
 
+        // 账号池选号时把"没有该模型配额记录"当作可用（NULL 放行），
+        // 如果上游模型列表里压根没有这个模型（例如账号已不支持 claude-opus-4-6），
+        // 上面的循环永远不会写入这个 modelId，导致该账号被误判为"可用"。
+        // 这里对 QUOTA_RELEVANT_MODELS 中上游未返回的模型显式写 0，避免误选中。
+        for (const modelId of QUOTA_RELEVANT_MODELS) {
+            if (!Object.prototype.hasOwnProperty.call(models, modelId)) {
+                upsertAccountModelQuota(account.id, modelId, 0, null);
+            }
+        }
+
         // 兼容：如果调用方指定了 model 且存在 quotaInfo，则返回该模型的信息（但 DB 仍写总体配额）
         let selected = null;
         if (model) {
@@ -385,9 +451,54 @@ export async function fetchQuotaInfo(account, model = null) {
 
         updateAccountQuota(account.id, minQuota, minQuotaResetTime);
 
+        // 顺带同步 5h / Weekly 额度分组和 AI 积分，供账号列表直接展示（失败不影响主流程）
+        await syncQuotaSummaryAndCredits(account);
+
         return selected || { remainingFraction: minQuota, resetTime: minQuotaResetTime };
     } catch (error) {
         throw error;
+    }
+}
+
+/**
+ * 读取 loadCodeAssist 中的 AI 积分（paidTier.availableCredits）
+ * 返回 null 表示本次未取到，调用方应保留旧值
+ */
+async function fetchAiCredits(account) {
+    const response = await fingerprintFetch(`${ANTIGRAVITY_CONFIG.base_url}/v1internal:loadCodeAssist`, {
+        method: 'POST',
+        headers: {
+            'Host': new URL(ANTIGRAVITY_CONFIG.base_url).host,
+            'User-Agent': ANTIGRAVITY_CONFIG.user_agent,
+            'Authorization': `Bearer ${account.access_token}`,
+            'Content-Type': 'application/json',
+            'Accept-Encoding': 'gzip'
+        },
+        body: JSON.stringify({
+            metadata: { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+        })
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const credits = data?.paidTier?.availableCredits;
+    if (!Array.isArray(credits)) return [];
+    return credits.map(c => ({
+        creditType: c.creditType || 'UNKNOWN',
+        creditAmount: c.creditAmount ?? null,
+        minimumCreditAmountForUsage: c.minimumCreditAmountForUsage ?? null
+    }));
+}
+
+async function syncQuotaSummaryAndCredits(account) {
+    const [summary, credits] = await Promise.all([
+        fetchQuotaSummary(account).catch(() => null),
+        fetchAiCredits(account).catch(() => null)
+    ]);
+    try {
+        if (summary) persistQuotaBuckets(account.id, summary);
+        if (credits) updateAccountCredits(account.id, credits);
+    } catch (error) {
+        console.error(`[TokenManager] persist quota summary for account ${account.id} failed:`, error.message);
     }
 }
 
@@ -396,104 +507,195 @@ export async function fetchQuotaInfo(account, model = null) {
  */
 export async function fetchDetailedQuotaInfo(account) {
     try {
-        // 确保有有效的 token
         await ensureValidToken(account);
-
-        const response = await fingerprintFetch(`${ANTIGRAVITY_CONFIG.base_url}/v1internal:fetchAvailableModels`, {
-            method: 'POST',
-            headers: {
-                'Host': new URL(ANTIGRAVITY_CONFIG.base_url).host,
-                'User-Agent': ANTIGRAVITY_CONFIG.user_agent,
-                'Authorization': `Bearer ${account.access_token}`,
-                'Content-Type': 'application/json',
-                'Accept-Encoding': 'gzip'
+        const [modelData, quotaSummary] = await Promise.all([
+            fetchAvailableModelsForAccount(account),
+            fetchQuotaSummary(account).catch(() => null)
+        ]);
+        const models = modelData?.models || {};
+        const modelSupport = {
+            'claude-opus-4-6': {
+                supported: ['claude-opus-4-6', 'claude-opus-4-6-thinking']
+                    .some(model => Object.prototype.hasOwnProperty.call(models, model)),
+                status: 'verified'
             },
-            body: JSON.stringify({
-                project: account.project_id || ''
-            })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch models: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const models = data.models || {};
-
-        // 解析每个模型的配额信息
-        const quotas = {};
-        let minQuota = 1;
-        let minQuotaResetTime = null;
-        let sawQuotaSignal = false;
-        const hasAnyRelevantModel = Object.keys(models).some((modelId) => QUOTA_RELEVANT_MODELS.has(modelId));
-
-        for (const [modelId, modelInfo] of Object.entries(models)) {
-            if (!modelInfo) continue;
-
-            const isRelevant = QUOTA_RELEVANT_MODELS.has(modelId);
-            // 图像生成模型不参与总体配额计算（它们有独立的配额池）
-            const isImageModel = isImageGenerationModel(modelId);
-            const shouldAffectOverall = (!hasAnyRelevantModel || isRelevant) && !isImageModel;
-
-            if (!modelInfo.quotaInfo) {
-                // For relevant models, missing quotaInfo should not be treated as "full".
-                if (isRelevant) {
-                    sawQuotaSignal = true;
-                    upsertAccountModelQuota(account.id, modelId, 0, null);
-                    quotas[modelId] = {
-                        remainingFraction: 0,
-                        resetTime: null,
-                        displayName: modelInfo.displayName || modelId
-                    };
-
-                    if (shouldAffectOverall) {
-                        minQuota = 0;
-                        minQuotaResetTime = null;
-                    }
-                }
-                continue;
+            'claude-sonnet-4-6': {
+                supported: ['claude-sonnet-4-6', 'claude-sonnet-4-6-thinking']
+                    .some(model => Object.prototype.hasOwnProperty.call(models, model)),
+                status: 'verified'
             }
+        };
+        const modelQuotas = await persistModelQuotaInfo(account, models);
+        const overallQuota = modelQuotas.overallQuota;
 
-            sawQuotaSignal = true;
-            const { remainingFraction: rawRemainingFraction, resetTime } = modelInfo.quotaInfo;
-            const remainingFraction = toQuotaFraction(rawRemainingFraction, 0);
-            const resetTimestamp = resetTime ? new Date(resetTime).getTime() : null;
-
-            if (isRelevant) {
-                upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTimestamp);
-            }
-
-            quotas[modelId] = {
-                remainingFraction,
-                resetTime: resetTimestamp,
-                displayName: modelInfo.displayName || modelId
-            };
-
-            // 跟踪最小配额用于更新账号总体配额
-            if (shouldAffectOverall && remainingFraction < minQuota) {
-                minQuota = remainingFraction;
-                minQuotaResetTime = resetTimestamp;
-            }
+        if (quotaSummary) {
+            persistQuotaBuckets(account.id, quotaSummary);
         }
-
-        if (!sawQuotaSignal) {
-            minQuota = 0;
-            minQuotaResetTime = null;
-        }
-
-        // 更新账号的总体配额（使用最小值）
-        updateAccountQuota(account.id, minQuota, minQuotaResetTime);
+        fetchAiCredits(account)
+            .then(credits => { if (credits) updateAccountCredits(account.id, credits); })
+            .catch(() => {});
 
         return {
             accountId: account.id,
             email: account.email,
-            quotas,
-            overallQuota: minQuota,
-            resetTime: minQuotaResetTime
+            quotas: modelQuotas.quotas,
+            overallQuota,
+            resetTime: modelQuotas.resetTime,
+            quotaGroups: quotaSummary ? normalizeQuotaGroups(quotaSummary) : [],
+            quotaSummaryStatus: quotaSummary ? 'verified' : 'unavailable',
+            modelSupport
         };
     } catch (error) {
         throw error;
     }
+}
+
+async function fetchAvailableModelsForAccount(account) {
+    const response = await fingerprintFetch(`${ANTIGRAVITY_CONFIG.base_url}/v1internal:fetchAvailableModels`, {
+        method: 'POST',
+        headers: {
+            'Host': new URL(ANTIGRAVITY_CONFIG.base_url).host,
+            'User-Agent': ANTIGRAVITY_CONFIG.user_agent,
+            'Authorization': `Bearer ${account.access_token}`,
+            'Content-Type': 'application/json',
+            'Accept-Encoding': 'gzip'
+        },
+        body: JSON.stringify({ project: account.project_id || '' })
+    });
+    if (!response.ok) throw new Error(`Failed to fetch models: ${response.status}`);
+    return response.json();
+}
+
+async function fetchQuotaSummary(account) {
+    const mergedGroups = new Map();
+    let sawResponse = false;
+    let lastError = null;
+    for (const url of QUOTA_SUMMARY_ENDPOINTS) {
+        try {
+        const response = await fingerprintFetch(url, {
+            method: 'POST',
+            headers: {
+                'Host': new URL(url).host,
+                'User-Agent': quotaSummaryUserAgent(),
+                'Authorization': `Bearer ${account.access_token}`,
+                'Content-Type': 'application/json',
+                'Accept-Encoding': 'gzip'
+            },
+            // 上游只接受 { project }；带 cloudaicompanionProject / metadata 会返回 400 INVALID_ARGUMENT
+            body: JSON.stringify({ project: account.project_id || '' })
+        });
+            if (!response.ok) {
+                lastError = new Error(`Quota summary failed: ${response.status}`);
+                continue;
+            }
+            sawResponse = true;
+            const data = await response.json();
+            for (const group of data.groups || []) {
+                const groupId = group.id || group.groupId || group.displayName || 'unknown';
+                const existing = mergedGroups.get(groupId) || {
+                    ...group,
+                    id: groupId,
+                    buckets: []
+                };
+                const bucketIds = new Set(existing.buckets.map(bucket => bucket.id || bucket.bucketId || bucket.name));
+                for (const bucket of group.buckets || []) {
+                    const bucketId = bucket.id || bucket.bucketId || bucket.name || 'unknown';
+                    if (!bucketIds.has(bucketId)) {
+                        existing.buckets.push(bucket);
+                        bucketIds.add(bucketId);
+                    }
+                }
+                mergedGroups.set(groupId, existing);
+            }
+            // 两个端点返回同一份数据，拿到一份即可
+            if (mergedGroups.size > 0) break;
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    if (mergedGroups.size > 0) return { groups: [...mergedGroups.values()] };
+    if (sawResponse) return { groups: [] };
+    throw lastError || new Error('Quota summary unavailable');
+}
+
+function normalizeQuotaGroups(data) {
+    return (data.groups || []).map(group => ({
+        groupId: group.id || group.groupId || group.displayName || 'unknown',
+        displayName: group.displayName || group.name || group.id || 'Quota',
+        buckets: (group.buckets || []).map(bucket => ({
+            bucketId: bucket.id || bucket.bucketId || bucket.name || 'unknown',
+            remainingFraction: toQuotaFraction(bucket.remainingFraction, 0),
+            resetTime: bucket.resetTime ? new Date(bucket.resetTime).getTime() : null,
+            window: bucket.window || null,
+            disabled: bucket.disabled === true
+        }))
+    }));
+}
+
+function persistQuotaBuckets(accountId, data) {
+    for (const group of normalizeQuotaGroups(data)) {
+        for (const bucket of group.buckets) {
+            upsertAccountQuotaBucket(
+                accountId,
+                group.groupId,
+                bucket.bucketId,
+                bucket.remainingFraction,
+                bucket.resetTime
+            );
+        }
+    }
+}
+
+async function persistModelQuotaInfo(account, models) {
+    const quotas = {};
+    let minQuota = 1;
+    let minQuotaResetTime = null;
+    let sawQuotaSignal = false;
+    for (const [modelId, modelInfo] of Object.entries(models)) {
+        if (!modelInfo) continue;
+        const isRelevant = QUOTA_RELEVANT_MODELS.has(modelId);
+        if (!modelInfo.quotaInfo) {
+            if (isRelevant) {
+                sawQuotaSignal = true;
+                upsertAccountModelQuota(account.id, modelId, 0, null);
+                quotas[modelId] = {
+                    remainingFraction: 0,
+                    resetTime: null,
+                    displayName: modelInfo.displayName || modelId
+                };
+            }
+            continue;
+        }
+        const remainingFraction = toQuotaFraction(modelInfo.quotaInfo.remainingFraction, 0);
+        const resetTime = modelInfo.quotaInfo.resetTime
+            ? new Date(modelInfo.quotaInfo.resetTime).getTime()
+            : null;
+        quotas[modelId] = {
+            remainingFraction,
+            resetTime,
+            displayName: modelInfo.displayName || modelId
+        };
+        if (isRelevant) {
+            sawQuotaSignal = true;
+            upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTime);
+            if (!isImageGenerationModel(modelId) && remainingFraction < minQuota) {
+                minQuota = remainingFraction;
+                minQuotaResetTime = resetTime;
+            }
+        }
+    }
+    // 同上：上游模型列表里压根没有的 relevant 模型要显式写 0，避免账号池误判为可用。
+    for (const modelId of QUOTA_RELEVANT_MODELS) {
+        if (!Object.prototype.hasOwnProperty.call(models, modelId)) {
+            upsertAccountModelQuota(account.id, modelId, 0, null);
+        }
+    }
+    if (!sawQuotaSignal) {
+        minQuota = 0;
+        minQuotaResetTime = null;
+    }
+    updateAccountQuota(account.id, minQuota, minQuotaResetTime);
+    return { quotas, overallQuota: minQuota, resetTime: minQuotaResetTime };
 }
 
 /**
@@ -586,8 +788,9 @@ export function startTokenRefreshScheduler(intervalMs = 50 * 60 * 1000) {
             const now = Date.now();
 
             for (const account of accounts) {
-                // 检查是否需要刷新
-                if (!account.token_expires_at || now >= account.token_expires_at - TOKEN_REFRESH_BUFFER) {
+                // 检查是否需要刷新；因 token 刷新失败处于 error 的账号也重试，以便配置修复后自动恢复
+                const expiring = !account.token_expires_at || now >= account.token_expires_at - TOKEN_REFRESH_BUFFER;
+                if (expiring || isRecoverableTokenError(account)) {
                     try {
                         await refreshAccessToken(account);
                     } catch (error) {

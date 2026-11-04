@@ -13,13 +13,44 @@ export const OAUTH_CONFIG = {
     ].join(' ')
 };
 
+/**
+ * 启动前校验 OAuth 客户端凭据。
+ * 缺失时所有账号的 token 刷新都会被 Google 以 "Could not determine client ID" 拒绝，
+ * 并把账号批量标记为 error，因此直接拒绝启动，避免静默失效。
+ */
+export function assertOAuthConfig() {
+    const missing = [];
+    if (!OAUTH_CONFIG.client_id) missing.push('GOOGLE_OAUTH_CLIENT_ID');
+    if (!OAUTH_CONFIG.client_secret) missing.push('GOOGLE_OAUTH_CLIENT_SECRET');
+    if (missing.length > 0) {
+        throw new Error(
+            `[Config] 缺少 OAuth 客户端凭据: ${missing.join(', ')}。` +
+            '请在 .env（或容器环境变量）中设置后再启动，否则所有账号的 token 刷新都会失败。'
+        );
+    }
+}
+
 // Antigravity API 配置
 // 版本号由 versionFetcher 服务动态更新，支持热更新
-let _agVersion = '1.19.5'; // 默认回退值
+let _agVersion = '2.25.0'; // 当前上游兼容版本回退值
+
+// 上游按 User-Agent 版本决定可见模型和额度分组：低于 2.25.0 时
+// Gemini 3.8 Flash 与 Gemini 额度分组都不返回（2026-11-03 实测），因此版本号不得低于该值
+const MIN_AG_VERSION = '2.25.0';
+
+function compareVersions(a, b) {
+    const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+    const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d !== 0) return d;
+    }
+    return 0;
+}
 
 export function setAgVersion(version) {
     if (version && typeof version === 'string' && /^\d+\.\d+\.\d+/.test(version)) {
-        _agVersion = version;
+        _agVersion = compareVersions(version, MIN_AG_VERSION) >= 0 ? version : MIN_AG_VERSION;
     }
 }
 
@@ -89,6 +120,11 @@ function parseBoolean(value, defaultValue) {
 
 // 可用模型列表
 export const AVAILABLE_MODELS = [
+    // Gemini 3.8 Flash：上游按 tier 区分档位；User-Agent 版本需 >= 2.25.0 才会返回（见 MIN_AG_VERSION）
+    // maxTokens / maxOutputTokens 取自上游 fetchAvailableModels（2026-11-04）
+    { id: 'gemini-3.8-flash-high', displayName: 'Gemini 3.8 Flash (High)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+    { id: 'gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash (Medium)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+    { id: 'gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash (Low)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
     { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
     // 兼容：通过模型名显式启用 thinking（映射到 gemini-3-flash）
     { id: 'gemini-3-flash-thinking', displayName: 'Gemini 3 Flash (Thinking)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
@@ -164,7 +200,8 @@ export const THINKING_MODELS = [
 
 // Claude 5.5 encodes the reasoning tier in the model ID
 // (e.g. claude-opus-5-5-high), so every tier is a thinking model.
-const CLAUDE_TIERED_THINKING_PATTERN = /^claude-(opus|sonnet)-5-5-(high|medium|low)$/;
+// Gemini 3.8 Flash 同样以档位后缀区分推理强度，也按思维链模型处理
+const CLAUDE_TIERED_THINKING_PATTERN = /^(claude-(opus|sonnet)-5-5|gemini-3\.8-flash)-(high|medium|low)$/;
 
 // 判断模型是否启用思维链
 export function isThinkingModel(model) {
@@ -182,8 +219,11 @@ export function isImageGenerationModel(model) {
 }
 
 // 获取实际发送的模型名称
+// `-no-thinking` 只是本地别名（关闭思维链），上游没有这个模型 ID，
+// 账号选择 / 配额判断必须按去掉后缀的真实模型来查，否则会误判为「没有账号支持该模型」
 export function getMappedModel(model) {
-    return MODEL_MAPPING[model] || model;
+    const base = String(model || '').replace(/-no-thinking$/, '');
+    return MODEL_MAPPING[base] || base;
 }
 
 // Safety settings：完整版（11 类）和基础版（5 类）

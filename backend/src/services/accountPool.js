@@ -1,4 +1,17 @@
-import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota } from '../db/index.js';
+import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota, getModelAvailabilityRows, getSetting, getAccountById } from '../db/index.js';
+
+/**
+ * 指定账号（固定使用某一个账号）
+ * settings.pinnedAccount = { id, strict }
+ *  - strict=true：只用该账号；它不能服务当前模型时直接报错（不换号）
+ *  - strict=false：优先用该账号；它不能服务时回退到正常轮询
+ */
+export function getPinnedAccountSetting() {
+    const raw = getSetting('pinnedAccount', null);
+    const id = Number(raw?.id);
+    if (!Number.isFinite(id) || id <= 0) return null;
+    return { id, strict: raw?.strict !== false };
+}
 import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
 import { RETRY_CONFIG, getMappedModel } from '../config.js';
 
@@ -17,6 +30,67 @@ const MAX_CONCURRENT_PER_ACCOUNT = Number(process.env.MAX_CONCURRENT_PER_ACCOUNT
 // 容量耗尽后的默认冷却时间（毫秒），如果上游返回了具体秒数，会在此基础上调整
 const CAPACITY_COOLDOWN_DEFAULT_MS = Number(process.env.CAPACITY_COOLDOWN_DEFAULT_MS || 15000);
 const CAPACITY_COOLDOWN_MAX_MS = Number(process.env.CAPACITY_COOLDOWN_MAX_MS || 120000);
+
+function formatClock(ts) {
+    const d = new Date(ts);
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatDuration(ms) {
+    let min = Math.max(0, Math.round(ms / 60000));
+    const d = Math.floor(min / 1440); min -= d * 1440;
+    const h = Math.floor(min / 60); min -= h * 60;
+    return [d && `${d}d`, h && `${h}h`, `${min}m`].filter(Boolean).join(' ');
+}
+
+/**
+ * 构造「没有可用账号」的明确错误，区分三种原因：
+ * - 额度耗尽：账号支持该模型，但上游配额为 0（有 reset 时间）→ 429 + Retry-After
+ * - 不支持：账号的上游模型列表里没有该模型（配额被写为 0 且无 reset 时间）
+ * - 停用：账号状态不是 active
+ */
+function buildNoAccountsError(model) {
+    if (!model) return new Error('没有可用账号：所有账号均处于禁用或异常状态');
+
+    let rows = [];
+    try { rows = getModelAvailabilityRows(model); } catch { /* ignore */ }
+
+    const inactive = rows.filter(r => r.status !== 'active');
+    const active = rows.filter(r => r.status === 'active');
+    const exhausted = active.filter(r => r.quota_reset_time);
+    const unsupported = active.filter(r => !r.quota_reset_time);
+
+    const parts = [];
+    let retryAfterMs = null;
+
+    if (exhausted.length > 0) {
+        const earliest = Math.min(...exhausted.map(r => r.quota_reset_time));
+        const remaining = earliest - Date.now();
+        if (remaining > 0) {
+            retryAfterMs = remaining;
+            parts.push(`${exhausted.length} 个支持该模型的账号额度已耗尽，最早 ${formatClock(earliest)} 恢复（约 ${formatDuration(remaining)} 后）`);
+        } else {
+            parts.push(`${exhausted.length} 个支持该模型的账号额度已到重置时间，等待下次配额同步（最多 10 分钟），或在管理面板手动刷新账号`);
+        }
+    }
+    if (unsupported.length > 0) {
+        parts.push(`${unsupported.length} 个账号不支持该模型`);
+    }
+    if (inactive.length > 0) {
+        parts.push(`${inactive.length} 个账号处于禁用或异常状态`);
+    }
+
+    const head = exhausted.length > 0 ? `模型 ${model} 暂无可用额度` : `模型 ${model} 不可用`;
+    const err = new Error(`${head}：${parts.join('；') || '没有任何账号'}`);
+    err.code = exhausted.length > 0 ? 'model_quota_exhausted' : 'model_not_available';
+    if (Number.isFinite(retryAfterMs)) {
+        // 标记为容量错误：路由层会返回 429 并带 Retry-After
+        err.upstreamStatus = 429;
+        err.retryAfterMs = retryAfterMs;
+    }
+    return err;
+}
 
 /**
  * 账号池管理类
@@ -43,7 +117,7 @@ class AccountPool {
         const accounts = getActiveAccounts(mappedModel);
 
         if (accounts.length === 0) {
-            throw new Error('No active accounts available');
+            throw buildNoAccountsError(mappedModel);
         }
 
         let earliestCooldownUntil = null;
@@ -116,10 +190,18 @@ class AccountPool {
      */
     async getNextAccount(model = null, options = null) {
         const mappedModel = model ? getMappedModel(model) : null;
+
+        const pinned = getPinnedAccountSetting();
+        if (pinned) {
+            const picked = await this._getPinnedAccount(pinned, mappedModel, options);
+            if (picked) return picked;
+            // 非严格模式：指定账号不可用时回退到正常轮询
+        }
+
         const accounts = getActiveAccounts(mappedModel);
 
         if (accounts.length === 0) {
-            throw new Error('No active accounts available');
+            throw buildNoAccountsError(mappedModel);
         }
 
         const excludeIds = new Set();
@@ -223,6 +305,52 @@ class AccountPool {
         }
 
         throw new Error('No available accounts with valid tokens');
+    }
+
+    /**
+     * 取指定账号。可用则返回账号；非严格模式下不可用返回 null（由调用方回退）；严格模式下不可用直接抛出原因。
+     */
+    async _getPinnedAccount(pinned, mappedModel, options) {
+        const fail = (reason, extra = {}) => {
+            if (!pinned.strict) return null;
+            const err = new Error(`指定账号不可用：${reason}（可在管理面板取消指定，或改为「优先」模式自动回退）`);
+            err.code = 'pinned_account_unavailable';
+            Object.assign(err, extra);
+            throw err;
+        };
+
+        const excluded = Array.isArray(options?.excludeAccountIds) && options.excludeAccountIds.map(Number).includes(pinned.id);
+        const account = getAccountById(pinned.id);
+        if (!account) return fail(`账号 id=${pinned.id} 不存在`);
+        const label = `${account.email}（id=${account.id}）`;
+        if (account.status !== 'active') return fail(`${label} 状态为 ${account.status}`);
+
+        if (mappedModel) {
+            const row = getModelAvailabilityRows(mappedModel).find(r => r.id === account.id);
+            if (row && row.quota_remaining !== null && row.quota_remaining <= 0) {
+                if (row.quota_reset_time) {
+                    const remaining = row.quota_reset_time - Date.now();
+                    if (remaining > 0) {
+                        return fail(`${label} 的 ${mappedModel} 额度已耗尽，${formatClock(row.quota_reset_time)} 恢复（约 ${formatDuration(remaining)} 后）`,
+                            { upstreamStatus: 429, retryAfterMs: remaining });
+                    }
+                } else {
+                    return fail(`${label} 不支持模型 ${mappedModel}`, { code: 'model_not_available' });
+                }
+            }
+        }
+
+        // 同一请求内已用过（重试换号）：严格模式下仍复用同一账号，非严格模式交给轮询
+        if (excluded && !pinned.strict) return null;
+
+        try {
+            const validAccount = await ensureValidToken(account);
+            this.lockAccount(account.id);
+            updateAccountLastUsed(account.id);
+            return validAccount;
+        } catch (err) {
+            return fail(`${label} token 刷新失败：${err.message}`);
+        }
     }
 
     /**

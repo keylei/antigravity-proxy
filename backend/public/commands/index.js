@@ -34,21 +34,9 @@ commands.register('auth:logout', async () => {
 });
 
 commands.register('auth:check', async () => {
-  const { accessToken } = api.getTokens();
-  if (!accessToken) {
-    store.set('user', null);
-    return false;
-  }
-  
-  try {
-    const user = await api.getMe();
-    store.set('user', user);
-    return true;
-  } catch {
-    store.set('user', null);
-    api.clearTokens();
-    return false;
-  }
+  // 管理面板已取消密码登录要求，直接视为已登录
+  store.set('user', { sub: 'admin', role: 'admin', username: 'admin' });
+  return true;
 });
 
 // ============ 导航命令 ============
@@ -96,8 +84,14 @@ commands.register('accounts:load', async ({ silent = false } = {}) => {
   store.set('accounts.error', null);
   
   try {
-    const result = await api.getAccounts();
-    store.set('accounts.list', result?.accounts || []);
+    const [result, settings] = await Promise.all([
+      api.getAccounts(),
+      api.getSettings().catch(() => null)
+    ]);
+    store.batch(() => {
+      store.set('accounts.list', result?.accounts || []);
+      store.set('accounts.pinned', settings?.pinnedAccount || null);
+    });
   } catch (error) {
     store.set('accounts.error', error.message);
     throw error;
@@ -242,6 +236,45 @@ commands.register('accounts:view-quota', async ({ id }) => {
     if (store.get('dialogs.quota.accountId') === id) {
       store.set('dialogs.quota.loading', false);
     }
+  }
+});
+
+// 指定账号：所有请求固定使用该账号
+commands.register('accounts:pin', async ({ id, email }) => {
+  const current = store.get('accounts.pinned');
+  const strict = current ? current.strict !== false : true;
+  try {
+    const r = await api.setPinnedAccount(Number(id), strict);
+    if (r?.error) throw new Error(r.error.message);
+    store.set('accounts.pinned', r.pinnedAccount);
+    toast.success(`已指定账号 ${email || r.email}，之后的请求只用这个账号`);
+  } catch (error) {
+    toast.error(error.message || '指定账号失败');
+  }
+});
+
+commands.register('accounts:unpin', async () => {
+  try {
+    await api.setPinnedAccount(null);
+    store.set('accounts.pinned', null);
+    toast.success('已取消指定，恢复多账号轮询');
+  } catch (error) {
+    toast.error(error.message || '取消指定失败');
+  }
+});
+
+// 切换指定模式：strict=只用该账号；prefer=该账号不可用时回退到轮询
+commands.register('accounts:pin-mode', async ({ currentStatus }) => {
+  const pinned = store.get('accounts.pinned');
+  if (!pinned) return;
+  const strict = currentStatus === 'strict';
+  try {
+    const r = await api.setPinnedAccount(pinned.id, strict);
+    if (r?.error) throw new Error(r.error.message);
+    store.set('accounts.pinned', r.pinnedAccount);
+    toast.success(strict ? '已切换为「仅用此账号」' : '已切换为「优先此账号，不可用时自动换号」');
+  } catch (error) {
+    toast.error(error.message || '切换失败');
   }
 });
 

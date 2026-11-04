@@ -485,6 +485,20 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         }
     }
 
+    // OpenAI 协议的 tool 消息通常只带 tool_call_id、不带 name；
+    // 而上游 functionResponse.name 必须与之前的 functionCall.name 一致，否则 Gemini 返回 400 INVALID_ARGUMENT。
+    // 预先扫描 assistant.tool_calls 建立 tool_call_id -> name 映射（与 anthropic-converter 的做法一致）。
+    const toolCallNameById = new Map();
+    for (const m of workingMessages) {
+        if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+        for (const tc of m.tool_calls) {
+            const name = tc?.function?.name;
+            if (tc?.id && name) toolCallNameById.set(tc.id, name);
+        }
+    }
+    const resolveToolName = (toolMsg) =>
+        toolMsg?.name || toolCallNameById.get(toolMsg?.tool_call_id) || 'unknown';
+
     // Claude thinking: if tool schema has no required, upstream may output only thinking then end (no tool_call)
     // Track tool names needing internal required placeholder.
     const claudeToolsNeedingRequiredPlaceholder = new Set();
@@ -515,7 +529,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
                 // Cross-model history: if current is Claude but tool_call_id isn't Claude-style (toolu_), degrade to text context
                 if (isClaudeModel && toolMsg.tool_call_id && !looksLikeClaudeToolId(toolMsg.tool_call_id)) {
-                    const name = toolMsg.name || 'unknown';
+                    const name = resolveToolName(toolMsg);
                     const output = limitToolOutput(textParts, toolOutputLimiter, {
                         provider: 'openai',
                         route: '/v1/chat/completions',
@@ -534,13 +548,13 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                         provider: 'openai',
                         route: '/v1/chat/completions',
                         model: model || null,
-                        tool_name: toolMsg.name || 'unknown',
+                        tool_name: resolveToolName(toolMsg),
                         tool_call_id: toolMsg.tool_call_id
                     });
                     toolParts.push({
                         functionResponse: {
                             id: toolMsg.tool_call_id,
-                            name: toolMsg.name || 'unknown',
+                            name: resolveToolName(toolMsg),
                             response: { output }
                         }
                     });
@@ -573,7 +587,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 }
                 continue;
             }
-            contents.push(convertMessage(msg, { isClaudeModel, isGeminiModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
+            contents.push(convertMessage(msg, { isClaudeModel, isGeminiModel, enableThinking, claudeToolsNeedingRequiredPlaceholder, resolveToolName }));
         }
     }
 
@@ -691,7 +705,8 @@ function convertMessage(msg, ctx = {}) {
         isClaudeModel = false,
         isGeminiModel = false,
         enableThinking = false,
-        claudeToolsNeedingRequiredPlaceholder = null
+        claudeToolsNeedingRequiredPlaceholder = null,
+        resolveToolName = (m) => m?.name || 'unknown'
     } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
@@ -703,7 +718,7 @@ function convertMessage(msg, ctx = {}) {
         const parts = [{
             functionResponse: {
                 id: msg.tool_call_id,
-                name: msg.name || 'unknown',
+                name: resolveToolName(msg),
                 response: { output }
             }
         }];

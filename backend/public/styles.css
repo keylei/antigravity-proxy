@@ -850,6 +850,20 @@ body {
   font-size: 14px;
 }
 
+.quota-section {
+  margin-bottom: 18px;
+}
+
+.quota-section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin: 16px 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .quota-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -975,6 +989,156 @@ body {
   font-size: 11px;
   color: var(--color-text-secondary);
   white-space: nowrap;
+}
+
+/* 账号列表：Claude / Gemini 额度状态 */
+/* 仅账号页放宽容器，给两列额度留出空间；其他页面保持 1000px */
+.container:has(.accounts-table) {
+  max-width: 1280px;
+}
+
+.accounts-table td,
+.accounts-table th {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.accounts-table {
+  table-layout: auto;
+}
+
+.accounts-table .account-email-cell {
+  max-width: 170px;
+}
+
+.accounts-table .account-email {
+  display: block;
+  word-break: break-all;
+  font-size: 13px;
+}
+
+.accounts-table .row-actions {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 4px;
+  justify-content: start;
+}
+
+.quota-status-cell {
+  width: 52%;
+  min-width: 360px;
+}
+
+.quota-families {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.quota-family-title {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.quota-line {
+  margin-bottom: 6px;
+}
+
+.quota-line-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-bottom: 2px;
+}
+
+.quota-line-percent {
+  font-weight: 700;
+}
+
+.quota-line .quota-bar {
+  height: 4px;
+  border: none;
+}
+
+.quota-line-reset {
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  text-align: right;
+  margin-top: 2px;
+}
+
+.quota-credits {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
+/* 账号排序 */
+.accounts-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.accounts-sort select {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-2);
+  color: inherit;
+}
+
+/* 指定账号横幅 */
+.pinned-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-left: 3px solid var(--color-warning);
+}
+
+.pinned-banner-text {
+  font-size: 13px;
+}
+
+.pinned-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-pinned {
+  border-color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 18%, transparent);
+}
+
+.refresh-token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.refresh-token-value {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-2);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.quota-hint {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 
 /* 错误信息直接显示 */

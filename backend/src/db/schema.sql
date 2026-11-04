@@ -27,6 +27,18 @@ CREATE TABLE IF NOT EXISTS account_model_quotas (
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 
+-- Antigravity Claude/Gemini 分组额度
+CREATE TABLE IF NOT EXISTS account_quota_buckets (
+    account_id INTEGER NOT NULL,
+    group_id TEXT NOT NULL,
+    bucket_id TEXT NOT NULL,
+    remaining_fraction REAL,
+    reset_time INTEGER,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+    PRIMARY KEY (account_id, group_id, bucket_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
 -- 请求日志表
 CREATE TABLE IF NOT EXISTS request_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 CREATE INDEX IF NOT EXISTS idx_accounts_quota ON accounts(quota_remaining);
 CREATE INDEX IF NOT EXISTS idx_account_model_quotas_model ON account_model_quotas(model);
 CREATE INDEX IF NOT EXISTS idx_account_model_quotas_model_quota ON account_model_quotas(model, quota_remaining);
+CREATE INDEX IF NOT EXISTS idx_account_quota_buckets_account ON account_quota_buckets(account_id);
 CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_request_logs_account ON request_logs(account_id);
 CREATE INDEX IF NOT EXISTS idx_request_attempt_logs_created ON request_attempt_logs(created_at);

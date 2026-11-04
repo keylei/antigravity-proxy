@@ -2,16 +2,44 @@ import { verifyAdmin } from '../middleware/auth.js';
 import {
     getAllAccounts, getAccountById, createAccount, updateAccountStatus, deleteAccount,
     getAllAccountsForRefresh,
+    getAccountQuotaBuckets, getAllQuotaBuckets,
     getRequestLogs, getRequestLogsTotal, getRequestStats, getRequestAttemptStats, getModelUsageStats, getModelAttemptUsageStats,
     getRequestAttemptLogs, getRequestAttemptLogsTotal,
     getSetting, setSetting
 } from '../db/index.js';
 import { initializeAccount, refreshAccessToken, fetchProjectId, fetchQuotaInfo, fetchDetailedQuotaInfo } from '../services/tokenManager.js';
-import { accountPool } from '../services/accountPool.js';
+import { accountPool, getPinnedAccountSetting } from '../services/accountPool.js';
 
 // 仪表盘「今日」统计的时区偏移（分钟）
 // 例如中国时间（UTC+8）可设置为 480，默认使用服务器本地时间（0 表示不偏移）
 const DASHBOARD_TZ_OFFSET_MINUTES = Number(process.env.DASHBOARD_TZ_OFFSET_MINUTES || 0);
+
+function groupStoredQuotaBuckets(rows) {
+    const groups = new Map();
+    for (const row of rows) {
+        if (!groups.has(row.group_id)) {
+            groups.set(row.group_id, { groupId: row.group_id, displayName: row.group_id, buckets: [] });
+        }
+        groups.get(row.group_id).buckets.push({
+            bucketId: row.bucket_id,
+            remainingFraction: row.remaining_fraction,
+            resetTime: row.reset_time,
+            window: null,
+            disabled: false
+        });
+    }
+    return [...groups.values()];
+}
+
+function parseCredits(raw) {
+    if (!raw) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
 
 function getDayStart(timestamp, offsetMinutes) {
     // 将时间平移到目标时区，取该时区的 00:00，再平移回 UTC 毫秒时间戳
@@ -70,7 +98,22 @@ export default async function adminRoutes(fastify) {
 
     // GET /admin/accounts
     fastify.get('/admin/accounts', async () => {
-        const accounts = getAllAccounts();
+        const bucketsByAccount = new Map();
+        for (const row of getAllQuotaBuckets()) {
+            if (!bucketsByAccount.has(row.account_id)) bucketsByAccount.set(row.account_id, []);
+            bucketsByAccount.get(row.account_id).push({
+                groupId: row.group_id,
+                bucketId: row.bucket_id,
+                remainingFraction: row.remaining_fraction,
+                resetTime: row.reset_time,
+                updatedAt: row.updated_at
+            });
+        }
+        const accounts = getAllAccounts().map(({ ai_credits, ...a }) => ({
+            ...a,
+            quotaBuckets: bucketsByAccount.get(a.id) || [],
+            aiCredits: parseCredits(ai_credits)
+        }));
         return { accounts };
     });
 
@@ -271,6 +314,13 @@ export default async function adminRoutes(fastify) {
 
         try {
             const quotaInfo = await fetchDetailedQuotaInfo(account);
+            // 详情弹窗需要显示 refresh_token（与 /admin/accounts/export 同为管理接口，暴露范围一致）
+            quotaInfo.refreshToken = account.refresh_token || null;
+            const storedBuckets = getAccountQuotaBuckets(id);
+            if (quotaInfo.quotaGroups.length === 0 && storedBuckets.length > 0) {
+                quotaInfo.quotaGroups = groupStoredQuotaBuckets(storedBuckets);
+                quotaInfo.quotaSummaryStatus = 'stale';
+            }
             return { success: true, data: quotaInfo };
         } catch (error) {
             return { error: { message: error.message } };
@@ -370,8 +420,24 @@ export default async function adminRoutes(fastify) {
     fastify.get('/admin/settings', async () => {
         return {
             defaultModel: getSetting('defaultModel', 'gemini-2.5-flash'),
-            pollingStrategy: getSetting('pollingStrategy', 'weighted')
+            pollingStrategy: getSetting('pollingStrategy', 'weighted'),
+            pinnedAccount: getPinnedAccountSetting()
         };
+    });
+
+    // PUT /admin/pinned-account  body: { id: number|null, strict?: boolean }
+    // 指定所有请求固定使用某个账号；id 为 null 时取消指定，恢复轮询
+    fastify.put('/admin/pinned-account', async (request) => {
+        const { id, strict = true } = request.body || {};
+        if (id === null || id === undefined || id === '') {
+            setSetting('pinnedAccount', null);
+            return { success: true, pinnedAccount: null };
+        }
+        const account = getAccountById(Number(id));
+        if (!account) return { error: { message: `账号 id=${id} 不存在` } };
+        const value = { id: account.id, strict: strict !== false };
+        setSetting('pinnedAccount', value);
+        return { success: true, pinnedAccount: value, email: account.email };
     });
 
     // PUT /admin/settings

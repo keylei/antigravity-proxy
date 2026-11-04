@@ -25,9 +25,6 @@ export class Shell extends Component {
               <span class="user-info">
                 ${this._escape(user?.username || 'Admin')}
               </span>
-              <button class="btn btn-sm btn-danger" data-cmd="auth:logout">
-                退出
-              </button>
             </div>
           </header>
 
