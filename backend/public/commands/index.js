@@ -253,6 +253,22 @@ commands.register('accounts:pin', async ({ id, email }) => {
   }
 });
 
+// 轻量同步指定账号：后端在额度用完时会自动换号，这里只拉设置，变化时刷新页面并提示
+commands.register('accounts:sync-pinned', async () => {
+  const settings = await api.getSettings();
+  const next = settings?.pinnedAccount || null;
+  const prev = store.get('accounts.pinned') || null;
+  if ((prev?.id ?? null) === (next?.id ?? null) && (prev?.strict ?? null) === (next?.strict ?? null)) return;
+  store.set('accounts.pinned', next);
+  if (prev && next && next.replacedFrom && next.replacedFrom.id === prev.id) {
+    const list = store.get('accounts.list') || [];
+    const to = list.find(a => a.id === next.id)?.email || `id=${next.id}`;
+    toast.info(`指定账号 ${next.replacedFrom.email || 'id=' + prev.id} 额度用完，已自动换成 ${to}`);
+    // 原账号额度已被写为 0，刷新列表让额度条同步
+    commands.dispatch('accounts:load', { silent: true }).catch(() => {});
+  }
+});
+
 commands.register('accounts:unpin', async () => {
   try {
     await api.setPinnedAccount(null);
@@ -272,7 +288,7 @@ commands.register('accounts:pin-mode', async ({ currentStatus }) => {
     const r = await api.setPinnedAccount(pinned.id, strict);
     if (r?.error) throw new Error(r.error.message);
     store.set('accounts.pinned', r.pinnedAccount);
-    toast.success(strict ? '已切换为「仅用此账号」' : '已切换为「优先此账号，不可用时自动换号」');
+    toast.success(strict ? '已切换为「仅用此账号」' : '已切换为「优先此账号，额度用完自动换号」');
   } catch (error) {
     toast.error(error.message || '切换失败');
   }

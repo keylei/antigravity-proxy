@@ -159,17 +159,31 @@ export class AccountsPage extends Component {
     return list.sort((x, y) => statusRank(x) - statusRank(y) || key(y) - key(x) || (x.id - y.id));
   }
 
+  _formatClockShort(ts) {
+    if (!ts) return '';
+    const d = new Date(Number(ts));
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
   _renderPinnedBanner(pinned, accounts) {
     if (!pinned) return '';
     const acc = accounts.find(a => a.id === pinned.id);
     const name = acc ? acc.email : `id=${pinned.id}（已删除）`;
     const strict = pinned.strict !== false;
+    const replaced = pinned.replacedFrom
+      ? `<div class="pinned-banner-sub">
+           ↻ ${this._escape(this._formatClockShort(pinned.replacedAt))} 原指定账号
+           <b>${this._escape(pinned.replacedFrom.email || 'id=' + pinned.replacedFrom.id)}</b> 额度用完，已自动换成当前账号
+         </div>`
+      : '';
     return `
       <div class="card mb-4 pinned-banner">
         <div class="pinned-banner-text">
           📌 已指定账号 <b>${this._escape(name)}</b>：
-          ${strict ? '所有请求<b>只用</b>这个账号，它不能用时直接报错' : '<b>优先</b>用这个账号，它不能用时自动换其他账号'}
+          ${strict ? '所有请求<b>只用</b>这个账号，它不能用时直接报错' : '<b>优先</b>用这个账号，额度用完时自动换成额度最多的账号'}
           ${acc && acc.status !== 'active' ? '<span class="text-danger">（该账号当前状态异常）</span>' : ''}
+          ${replaced}
         </div>
         <div class="pinned-banner-actions">
           <button class="btn btn-sm" data-cmd="accounts:pin-mode" data-status="${strict ? 'prefer' : 'strict'}">
@@ -694,6 +708,17 @@ export class AccountsPage extends Component {
 
   onMount() {
     this.watch(['accounts', 'dialogs.oauth', 'dialogs.quota', 'dialogs.import']);
+    // 每 5 秒只拉一次设置：后端额度用完自动换号后，横幅与 📌 及时跟上（变化时才整表刷新）
+    this._autoRefreshTimer = setInterval(() => {
+      if (document.hidden) return;
+      if (!store.get('accounts.pinned')) return;
+      commands.dispatch('accounts:sync-pinned').catch(() => {});
+    }, 5000);
+  }
+
+  onUnmount() {
+    if (this._autoRefreshTimer) clearInterval(this._autoRefreshTimer);
+    this._autoRefreshTimer = null;
   }
 
   onUpdate() {

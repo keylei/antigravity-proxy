@@ -1108,6 +1108,12 @@ body {
   font-size: 13px;
 }
 
+.pinned-banner-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
 .pinned-banner-actions {
   display: flex;
   gap: 8px;

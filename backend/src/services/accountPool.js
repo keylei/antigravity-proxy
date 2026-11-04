@@ -1,19 +1,53 @@
-import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota, getModelAvailabilityRows, getSetting, getAccountById } from '../db/index.js';
+import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota, getModelAvailabilityRows, getSetting, setSetting, getAccountById, upsertAccountModelQuota } from '../db/index.js';
+import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
+import { RETRY_CONFIG, getMappedModel, AVAILABLE_MODELS, isImageGenerationModel } from '../config.js';
 
 /**
  * 指定账号（固定使用某一个账号）
- * settings.pinnedAccount = { id, strict }
+ * settings.pinnedAccount = { id, strict, replacedFrom?, replacedReason?, replacedAt? }
  *  - strict=true：只用该账号；它不能服务当前模型时直接报错（不换号）
- *  - strict=false：优先用该账号；它不能服务时回退到正常轮询
+ *  - strict=false：优先用该账号；它额度用完时自动改为指定额度最多的另一个账号
  */
 export function getPinnedAccountSetting() {
     const raw = getSetting('pinnedAccount', null);
     const id = Number(raw?.id);
     if (!Number.isFinite(id) || id <= 0) return null;
-    return { id, strict: raw?.strict !== false };
+    return {
+        id,
+        strict: raw?.strict !== false,
+        replacedFrom: raw?.replacedFrom || null,
+        replacedReason: raw?.replacedReason || null,
+        replacedAt: raw?.replacedAt || null
+    };
 }
-import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
-import { RETRY_CONFIG, getMappedModel } from '../config.js';
+
+/**
+ * 解析上游「个人额度用完」错误里的重置时间，如
+ * "Individual quota reached ... Resets in 136h22m15s." → 毫秒
+ */
+function parseQuotaResetMs(message) {
+    const m = String(message || '').match(/resets? in\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
+    if (!m || !(m[1] || m[2] || m[3] || m[4])) return null;
+    const [d, h, mi, s] = [m[1], m[2], m[3], m[4]].map(v => Number(v || 0));
+    const ms = (((d * 24 + h) * 60 + mi) * 60 + s) * 1000;
+    return ms > 0 ? ms : null;
+}
+
+// 上游额度按分组共享：Claude + GPT 一组，Gemini 一组（图像模型单独计）
+function quotaFamily(model) {
+    const m = String(model || '');
+    if (/^(claude|gpt)/i.test(m)) return 'claude';
+    if (/^gemini/i.test(m) && !isImageGenerationModel(m)) return 'gemini';
+    return null;
+}
+
+function sameFamilyModels(model) {
+    const family = quotaFamily(model);
+    if (!family) return [model];
+    const all = new Set(AVAILABLE_MODELS.map(x => getMappedModel(x.id)));
+    all.add(model);
+    return [...all].filter(x => quotaFamily(x) === family);
+}
 
 function parseBoolean(value, defaultValue = false) {
     if (value === undefined || value === null || value === '') return defaultValue;
@@ -194,8 +228,13 @@ class AccountPool {
         const pinned = getPinnedAccountSetting();
         if (pinned) {
             const picked = await this._getPinnedAccount(pinned, mappedModel, options);
-            if (picked) return picked;
-            // 非严格模式：指定账号不可用时回退到正常轮询
+            if (picked?.account) return picked.account;
+            // 兜底：上游报额度用完时 markQuotaExhausted 已直接换号；这里处理由配额同步发现的额度为 0
+            if (picked?.exhausted && !pinned.strict) {
+                const replacement = await this._replacePinnedAccount(pinned, mappedModel, options, picked.reason);
+                if (replacement) return replacement;
+            }
+            // 其他原因（不支持该模型、临时冷却等）：本次请求回退到正常轮询，不改指定
         }
 
         const accounts = getActiveAccounts(mappedModel);
@@ -308,14 +347,81 @@ class AccountPool {
     }
 
     /**
-     * 取指定账号。可用则返回账号；非严格模式下不可用返回 null（由调用方回退）；严格模式下不可用直接抛出原因。
+     * 优先模式下指定账号额度用完：改为指定当前模型额度最多的另一个可用账号（写回设置，页面同步显示）
+     */
+    _replacementCandidates(excludeIds, mappedModel) {
+        const exclude = new Set([...excludeIds].map(Number));
+        // getActiveAccounts(model) 已按该模型剩余额度降序，且排除了额度为 0 的账号
+        return getActiveAccounts(mappedModel).filter(a =>
+            !exclude.has(a.id) && !(mappedModel && this.isAccountInCooldown(a.id, mappedModel)));
+    }
+
+    /**
+     * 把指定账号从 fromId 换成 candidate（写回设置，页面轮询设置时同步显示）。
+     * 并发请求可能已经替换过，只在当前指定仍是 fromId 时写回。
+     */
+    _swapPinned(fromId, candidate, mappedModel, reason) {
+        const current = getPinnedAccountSetting();
+        if (!current || current.id !== fromId || current.strict) return false;
+        const from = getAccountById(fromId);
+        setSetting('pinnedAccount', {
+            id: candidate.id,
+            strict: false,
+            replacedFrom: { id: fromId, email: from?.email || null },
+            replacedReason: reason || null,
+            replacedAt: Date.now()
+        });
+        console.log(`[ACCOUNT_POOL] pinned account ${fromId} (${from?.email}) exhausted for ${mappedModel}, switched to ${candidate.id} (${candidate.email})`);
+        return true;
+    }
+
+    /**
+     * 上游刚报「额度用完」时调用：若该账号正是「优先」模式的指定账号，立即换成额度最多的另一个，
+     * 不等下一次请求再来检查。token 有效性留到真正使用时校验（失败时本次请求回退轮询）。
+     */
+    _swapPinnedOnExhausted(accountId, mappedModel, reason) {
+        const pinned = getPinnedAccountSetting();
+        if (!pinned || pinned.strict || pinned.id !== accountId) return;
+        const [candidate] = this._replacementCandidates([accountId], mappedModel);
+        if (!candidate) {
+            console.log(`[ACCOUNT_POOL] pinned account ${accountId} exhausted for ${mappedModel}, no replacement available`);
+            return;
+        }
+        this._swapPinned(accountId, candidate, mappedModel, reason);
+    }
+
+    /**
+     * 兜底：选号时发现指定账号额度为 0（例如由定时配额同步写入），当场换号并返回新账号
+     */
+    async _replacePinnedAccount(pinned, mappedModel, options, reason) {
+        const candidates = this._replacementCandidates([pinned.id, ...(options?.excludeAccountIds || [])], mappedModel);
+
+        for (const candidate of candidates) {
+            try {
+                const valid = await ensureValidToken(candidate);
+                this._swapPinned(pinned.id, candidate, mappedModel, reason);
+                this.lockAccount(candidate.id);
+                updateAccountLastUsed(candidate.id);
+                return valid;
+            } catch (err) {
+                console.error(`[ACCOUNT_POOL] replace pinned: ensureValidToken failed for ${candidate.id} (${candidate.email}):`, err.message);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 取指定账号。
+     * 返回 { account } 表示可用；返回 { exhausted, reason } 表示不可用（exhausted=额度用完）。
+     * 严格模式下不可用直接抛出原因。
      */
     async _getPinnedAccount(pinned, mappedModel, options) {
         const fail = (reason, extra = {}) => {
-            if (!pinned.strict) return null;
-            const err = new Error(`指定账号不可用：${reason}（可在管理面板取消指定，或改为「优先」模式自动回退）`);
+            const { exhausted = false, ...errExtra } = extra;
+            if (!pinned.strict) return { exhausted, reason };
+            const err = new Error(`指定账号不可用：${reason}（可在管理面板取消指定，或改为「优先」模式自动换号）`);
             err.code = 'pinned_account_unavailable';
-            Object.assign(err, extra);
+            Object.assign(err, errExtra);
             throw err;
         };
 
@@ -332,7 +438,7 @@ class AccountPool {
                     const remaining = row.quota_reset_time - Date.now();
                     if (remaining > 0) {
                         return fail(`${label} 的 ${mappedModel} 额度已耗尽，${formatClock(row.quota_reset_time)} 恢复（约 ${formatDuration(remaining)} 后）`,
-                            { upstreamStatus: 429, retryAfterMs: remaining });
+                            { upstreamStatus: 429, retryAfterMs: remaining, exhausted: true });
                     }
                 } else {
                     return fail(`${label} 不支持模型 ${mappedModel}`, { code: 'model_not_available' });
@@ -340,17 +446,42 @@ class AccountPool {
             }
         }
 
+        // 临时冷却（上游短暂容量不足）：本次回退，不替换指定
+        if (mappedModel && this.isAccountInCooldown(account.id, mappedModel) && !pinned.strict) {
+            return { exhausted: false, reason: `${label} 处于临时冷却` };
+        }
+
         // 同一请求内已用过（重试换号）：严格模式下仍复用同一账号，非严格模式交给轮询
-        if (excluded && !pinned.strict) return null;
+        if (excluded && !pinned.strict) return { exhausted: false, reason: `${label} 本次请求已失败` };
 
         try {
             const validAccount = await ensureValidToken(account);
             this.lockAccount(account.id);
             updateAccountLastUsed(account.id);
-            return validAccount;
+            return { account: validAccount };
         } catch (err) {
             return fail(`${label} token 刷新失败：${err.message}`);
         }
+    }
+
+    /**
+     * 上游明确返回「个人额度用完 + 重置时间」时：把该账号同一额度分组下的所有模型额度记为 0，
+     * 写入重置时间，并在内存冷却到重置时间。之后选号（轮询 / 指定账号）都会直接跳过它，不再先请求一次。
+     */
+    markQuotaExhausted(accountId, model, resetAt) {
+        const models = sameFamilyModels(model);
+        for (const m of models) {
+            try {
+                const row = getModelAvailabilityRows(m).find(r => r.id === accountId);
+                // 额度 0 且无重置时间 = 账号不支持该模型，保持原样，避免被误显示成「额度耗尽」
+                const unsupported = row && row.quota_remaining !== null && row.quota_remaining <= 0 && !row.quota_reset_time;
+                if (!unsupported) upsertAccountModelQuota(accountId, m, 0, resetAt);
+            } catch { /* ignore */ }
+            if (!DISABLE_LOCAL_LIMITS) this.capacityCooldowns.set(`${accountId}:${m}`, resetAt);
+        }
+        console.log(`[ACCOUNT_POOL] account ${accountId} quota exhausted for ${models.length} ${quotaFamily(model) || model} model(s), resets at ${formatClock(resetAt)}`);
+        this._swapPinnedOnExhausted(accountId, model,
+            `${model} 额度已耗尽，${formatClock(resetAt)} 恢复`);
     }
 
     /**
@@ -430,9 +561,17 @@ class AccountPool {
      * 标记账号在某个模型上容量耗尽，进入短暂冷却期
      */
     markCapacityLimited(accountId, model, message) {
-        if (DISABLE_LOCAL_LIMITS) return;
         const mappedModel = model ? getMappedModel(model) : null;
         if (!accountId || !mappedModel) return;
+
+        // 「个人额度用完」（重置时间通常以小时计）：持久化为额度 0，直到重置
+        const quotaResetMs = parseQuotaResetMs(message);
+        if (quotaResetMs && quotaResetMs > 60 * 1000) {
+            this.markQuotaExhausted(accountId, mappedModel, Date.now() + quotaResetMs);
+            return quotaResetMs;
+        }
+
+        if (DISABLE_LOCAL_LIMITS) return;
 
         let cooldownMs = CAPACITY_COOLDOWN_DEFAULT_MS;
         const key = `${accountId}:${mappedModel}`;
