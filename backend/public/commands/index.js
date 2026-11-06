@@ -91,6 +91,8 @@ commands.register('accounts:load', async ({ silent = false } = {}) => {
     store.batch(() => {
       store.set('accounts.list', result?.accounts || []);
       store.set('accounts.pinned', settings?.pinnedAccount || null);
+      store.set('accounts.strategy', settings?.pollingStrategy || 'round-robin');
+      store.set('accounts.stickyAccounts', settings?.stickyAccounts || {});
     });
   } catch (error) {
     store.set('accounts.error', error.message);
@@ -181,6 +183,159 @@ commands.register('accounts:refresh-all', async () => {
   }
 });
 
+// ============ 账号健康检测 ============
+
+let healthPollTimer = null;
+
+function stopHealthPoll() {
+  if (healthPollTimer) clearTimeout(healthPollTimer);
+  healthPollTimer = null;
+}
+
+async function pollHealthCheck() {
+  stopHealthPoll();
+  try {
+    const r = await api.getHealthCheck();
+    const job = r?.job || null;
+    store.set('dialogs.health.job', job);
+    if (job?.running) {
+      healthPollTimer = setTimeout(pollHealthCheck, 1500);
+    } else if (job) {
+      store.set('dialogs.health.starting', false);
+      // 检测会改写账号状态与额度，结束后刷新列表
+      commands.dispatch('accounts:load', { silent: true }).catch(() => {});
+    }
+  } catch (error) {
+    store.set('dialogs.health.starting', false);
+    toast.error(error.message || '获取检测进度失败');
+  }
+}
+
+commands.register('health:open', async () => {
+  store.set('dialogs.health.open', true);
+  await pollHealthCheck();
+});
+
+commands.register('health:close', () => {
+  store.set('dialogs.health.open', false);
+  // 关闭弹窗不中断后台检测，只停止轮询；重新打开会继续显示进度
+  stopHealthPoll();
+});
+
+commands.register('health:start', async ({ probe = true } = {}) => {
+  store.set('dialogs.health.open', true);
+  store.set('dialogs.health.starting', true);
+  try {
+    const r = await api.startHealthCheck(probe);
+    store.set('dialogs.health.job', r?.job || null);
+    await pollHealthCheck();
+  } catch (error) {
+    store.set('dialogs.health.starting', false);
+    toast.error(error.message || '启动检测失败');
+  }
+});
+
+// 单账号检测：结果存到 accounts.health[id]，在账号行内显示
+commands.register('health:check-one', async ({ id, email }) => {
+  const key = String(id);
+  if (store.get(`accounts.healthChecking.${key}`)) return;
+  store.set(`accounts.healthChecking.${key}`, true);
+  try {
+    const r = await api.checkAccountHealth(id, true);
+    const result = r?.result;
+    if (!result) throw new Error(r?.error?.message || '检测失败');
+    store.set(`accounts.health.${key}`, result);
+    const name = email || result.email;
+    if (result.level === 'ok') {
+      const ms = typeof result.probeLatencyMs === 'number' ? `，测试请求 ${result.probeLatencyMs}ms` : '';
+      const notes = result.notes?.length ? `（${result.notes.join('；')}）` : '';
+      toast.success(`${name} 连接正常${ms}${notes}`);
+    } else if (result.level === 'warn') {
+      toast.warning(`${name}：${result.message}`);
+    } else {
+      toast.error(`${name} 不能用：${result.message}`);
+    }
+    // 检测会刷新 token / 额度 / 状态，同步列表
+    await commands.dispatch('accounts:load', { silent: true });
+  } catch (error) {
+    toast.error(error.message || '检测失败');
+  } finally {
+    store.set(`accounts.healthChecking.${key}`, false);
+  }
+});
+
+function healthBadAccounts(job) {
+  return (job?.results || []).filter(r => r.level === 'fail');
+}
+
+function downloadText(filename, text, type = 'text/plain') {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // 非安全上下文下 clipboard API 不可用，退回 execCommand
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  }
+}
+
+commands.register('health:copy-bad', async () => {
+  const bad = healthBadAccounts(store.get('dialogs.health.job'));
+  if (bad.length === 0) {
+    toast.info('没有连接不上的账号');
+    return;
+  }
+  const ok = await copyText(bad.map(r => r.email).join('\n'));
+  ok ? toast.success(`已复制 ${bad.length} 个邮箱`) : toast.error('复制失败');
+});
+
+commands.register('health:export-bad', () => {
+  const job = store.get('dialogs.health.job');
+  const bad = healthBadAccounts(job);
+  if (bad.length === 0) {
+    toast.info('没有连接不上的账号');
+    return;
+  }
+  const stamp = new Date(job.finishedAt || Date.now()).toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const header = 'id,email,reason,message,detail';
+  const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = bad.map(r => [r.id, r.email, r.reason, r.message, r.detail].map(esc).join(','));
+  // 加 BOM，Excel 打开中文不乱码
+  downloadText(`bad-accounts-${stamp}.csv`, '\uFEFF' + [header, ...rows].join('\r\n'), 'text/csv;charset=utf-8');
+  toast.success(`已导出 ${bad.length} 个连接不上的账号`);
+});
+
+commands.register('health:select-bad', () => {
+  const bad = healthBadAccounts(store.get('dialogs.health.job'));
+  const existing = new Set((store.get('accounts.list') || []).map(a => String(a.id)));
+  const ids = bad.map(r => String(r.id)).filter(id => existing.has(id));
+  if (ids.length === 0) {
+    toast.info('没有可选中的账号');
+    return;
+  }
+  store.batch(() => {
+    store.set('accounts.selectedIds', ids);
+    store.set('dialogs.health.open', false);
+  });
+  stopHealthPoll();
+  toast.success(`已在列表中选中 ${ids.length} 个账号，可批量禁用或删除`);
+});
+
 commands.register('accounts:toggle-status', async ({ id, currentStatus }) => {
   const newStatus = currentStatus === 'active' ? 'disabled' : 'active';
   const actionText = newStatus === 'active' ? '启用' : '禁用';
@@ -253,9 +408,29 @@ commands.register('accounts:pin', async ({ id, email }) => {
   }
 });
 
+// 全局选号策略：round-robin=每次请求换号；sticky=一个号用完额度再换下一个
+commands.register('accounts:set-strategy', async ({ strategy }) => {
+  try {
+    const r = await api.setPoolStrategy(strategy);
+    store.batch(() => {
+      store.set('accounts.strategy', r.pollingStrategy);
+      store.set('accounts.stickyAccounts', r.stickyAccounts || {});
+    });
+    toast.success(r.pollingStrategy === 'sticky'
+      ? '已切换为「用完再换」：一直用当前号，额度用完再换下一个'
+      : '已切换为「每次换号」：每次请求按顺序换下一个号');
+  } catch (error) {
+    toast.error(error.message || '切换失败');
+    // 失败时把下拉框恢复成服务器上的实际值
+    commands.dispatch('accounts:load', { silent: true }).catch(() => {});
+  }
+});
+
 // 轻量同步指定账号：后端在额度用完时会自动换号，这里只拉设置，变化时刷新页面并提示
 commands.register('accounts:sync-pinned', async () => {
   const settings = await api.getSettings();
+  // 「用完再换」模式下当前号会随额度变化，顺带同步
+  store.set('accounts.stickyAccounts', settings?.stickyAccounts || {});
   const next = settings?.pinnedAccount || null;
   const prev = store.get('accounts.pinned') || null;
   if ((prev?.id ?? null) === (next?.id ?? null) && (prev?.strict ?? null) === (next?.strict ?? null)) return;

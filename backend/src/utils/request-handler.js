@@ -5,6 +5,8 @@ import { forceRefreshToken } from '../services/tokenManager.js';
 import { createRequestAttemptLog, updateAccountStatus } from '../db/index.js';
 
 function getLastUsedAccountId(accountPool) {
+    // 「用完再换」模式要连续使用同一个号，不能把上一个用过的号排除在外
+    if (accountPool?.getStrategy?.() === 'sticky') return null;
     const n = Number(accountPool?.lastUsedAccountId);
     if (!Number.isFinite(n) || n <= 0) return null;
     return n;

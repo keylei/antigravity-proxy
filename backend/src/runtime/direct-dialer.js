@@ -90,6 +90,9 @@ async function pickIp(host, port) {
 }
 
 function handleConnect(req, clientSocket, head) {
+    // 必须立即挂上：pickIp 探测期间客户端若断开（ECONNRESET），无监听的 'error' 会让整个进程崩溃
+    let upstream = null;
+    clientSocket.on('error', () => { if (upstream) upstream.destroy(); });
     const [host, portStr] = String(req.url || '').split(':');
     const port = Number(portStr || 443);
     if (!host || !Number.isFinite(port)) {
@@ -98,7 +101,8 @@ function handleConnect(req, clientSocket, head) {
     }
 
     pickIp(host, port).then((ip) => {
-        const upstream = net.connect({ host: ip, port });
+        if (clientSocket.destroyed) return;
+        upstream = net.connect({ host: ip, port });
         let gotUpstreamData = false;
         upstream.once('connect', () => {
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -115,10 +119,10 @@ function handleConnect(req, clientSocket, head) {
                 else clientSocket.destroy(err);
             }
         });
-        clientSocket.on('error', () => upstream.destroy());
         clientSocket.on('close', () => upstream.destroy());
         upstream.on('close', () => clientSocket.destroy());
     }).catch((err) => {
+        if (clientSocket.destroyed) return;
         clientSocket.end(`HTTP/1.1 502 Bad Gateway\r\nX-Error: ${String(err.message).replace(/[\r\n]/g, ' ')}\r\n\r\n`);
     });
 }

@@ -21,6 +21,8 @@ export class AccountsPage extends Component {
     const selectedAccounts = accounts.filter(a => selectedIds.includes(String(a.id)));
     const hasActiveSelected = selectedAccounts.some(a => a.status === 'active');
     const hasDisabledSelected = selectedAccounts.some(a => a.status !== 'active');
+    const healthRunning = !!store.get('dialogs.health.job')?.running;
+    const strategy = store.get('accounts.strategy') || 'round-robin';
 
     return `
       <div class="accounts-page">
@@ -46,6 +48,13 @@ export class AccountsPage extends Component {
                     ['gemini-5h', 'Gemini 5h 剩余 ↓'],
                     ['claude-usable', 'Claude 当前可用剩余 ↓'],
                   ].map(([v, t]) => `<option value="${v}" ${sortBy === v ? 'selected' : ''}>${t}</option>`).join('')}
+                </select>
+              </label>
+              <label class="accounts-sort" title="全局选号方式。📍 指定账号时以指定为准">
+                选号
+                <select class="input input-sm" data-action="strategy">
+                  <option value="round-robin" ${strategy !== 'sticky' ? 'selected' : ''}>每次换号（额度平均消耗）</option>
+                  <option value="sticky" ${strategy === 'sticky' ? 'selected' : ''}>用完再换（一个号用完再下一个）</option>
                 </select>
               </label>
               ${selectedCount > 0 ? `<span class="selection-count">已选 ${selectedCount} 个</span>` : ''}
@@ -89,12 +98,16 @@ export class AccountsPage extends Component {
                 <button class="btn btn-sm" data-cmd="accounts:refresh-all" ${refreshingAll ? 'disabled' : ''}>
                   ${refreshingAll ? '<span class="spinner"></span>' : ''} 刷新全部
                 </button>
+                <button class="btn btn-sm" data-cmd="health:open" title="检测每个账号能否连接，并列出连接不上的账号">
+                  ${healthRunning ? '<span class="spinner"></span>' : '🩺'} 健康检测
+                </button>
               `}
             </div>
           </div>
         </div>
 
         ${this._renderPinnedBanner(pinned, list || [])}
+        ${pinned ? '' : this._renderStickyBanner(strategy, list || [])}
 
         <div class="card">
           <div class="table-wrapper">
@@ -125,7 +138,108 @@ export class AccountsPage extends Component {
         ${this._renderOAuthDialog()}
         ${this._renderQuotaDialog()}
         ${this._renderImportDialog()}
+        ${this._renderHealthDialog()}
       </div>
+    `;
+  }
+
+  // ============ 健康检测弹窗 ============
+
+  _renderHealthDialog() {
+    const { job = null, starting = false } = store.get('dialogs.health') || {};
+    const running = !!job?.running;
+    const busy = running || starting;
+    const results = Array.isArray(job?.results) ? job.results : [];
+    const bad = results.filter(r => r.level === 'fail');
+    const warn = results.filter(r => r.level === 'warn');
+    const ok = results.filter(r => r.level === 'ok');
+    const skipped = Array.isArray(job?.skipped) ? job.skipped : [];
+
+    let body;
+    if (!job) {
+      body = `
+        <div class="health-empty text-secondary">
+          还没有检测记录。点击「开始检测」后会对每个账号刷新 token、同步额度，并发一条极小的测试请求。
+        </div>`;
+    } else {
+      const percent = job.total > 0 ? Math.round((job.done / job.total) * 100) : 100;
+      const when = job.finishedAt
+        ? `完成于 ${this._formatTime(job.finishedAt)}，用时 ${Math.round((job.finishedAt - job.startedAt) / 1000)} 秒`
+        : `开始于 ${this._formatTime(job.startedAt)}`;
+      body = `
+        <div class="health-progress">
+          <div class="health-progress-head">
+            <span>${running ? (job.retrying ? `正在重测 ${job.retrying} 个网络失败的号` : '正在检测') : '检测结果'}：${job.done}/${job.total}</span>
+            <span class="text-secondary">${this._escape(when)}${job.options?.probe ? '' : '（未发测试请求）'}</span>
+          </div>
+          <div class="quota-bar"><span class="quota-bar-fill ${running ? 'warn' : 'good'}" style="width:${percent}%"></span></div>
+        </div>
+        <div class="health-summary">
+          <div class="health-chip health-chip-fail">不能用 <b>${bad.length}</b></div>
+          <div class="health-chip health-chip-warn">有警告 <b>${warn.length}</b></div>
+          <div class="health-chip health-chip-ok">正常 <b>${ok.length}</b></div>
+          ${skipped.length ? `<div class="health-chip">已禁用跳过 <b>${skipped.length}</b></div>` : ''}
+        </div>
+        ${this._renderHealthSection('连接不上的账号', bad, 'fail', true)}
+        ${this._renderHealthSection('有警告的账号', warn, 'warn', false)}
+        ${this._renderHealthSection('正常的账号', ok, 'ok', false)}
+      `;
+    }
+
+    return `
+      <dialog id="healthDialog" class="quota-dialog health-dialog">
+        <div class="dialog-header">
+          <div class="dialog-title">账号健康检测</div>
+          <div class="dialog-subtitle">检测在后台进行，关闭弹窗不会中断</div>
+        </div>
+        <div class="dialog-body">${body}</div>
+        <div class="dialog-footer">
+          <label class="health-probe-toggle text-secondary">
+            <input type="checkbox" id="healthProbe" ${job?.options?.probe === false ? '' : 'checked'} ${busy ? 'disabled' : ''} />
+            发测试请求（更准，每号约消耗 1 次 Gemini Flash 调用）
+          </label>
+          ${bad.length ? `
+            <button class="btn btn-sm" data-cmd="health:copy-bad">复制邮箱</button>
+            <button class="btn btn-sm" data-cmd="health:export-bad">导出 CSV</button>
+            <button class="btn btn-sm btn-warning" data-cmd="health:select-bad" ${busy ? 'disabled' : ''}>在列表中选中</button>
+          ` : ''}
+          <button class="btn" data-cmd="health:close">关闭</button>
+          <button class="btn btn-primary" data-action="health-start" ${busy ? 'disabled' : ''}>
+            ${busy ? '<span class="spinner"></span> 检测中' : (job ? '重新检测' : '开始检测')}
+          </button>
+        </div>
+      </dialog>
+    `;
+  }
+
+  _renderHealthSection(title, rows, level, open) {
+    if (rows.length === 0) return '';
+    const fmtQ = q => (q && typeof q.remaining === 'number') ? `${Math.round(q.remaining * 100)}%` : '-';
+    const body = rows.map(r => `
+      <tr>
+        <td class="mono">${r.id}</td>
+        <td>${this._escape(r.email)}</td>
+        <td>
+          <div class="health-msg health-msg-${level}">${this._escape(r.message)}</div>
+          ${r.notes?.length ? `<div class="text-secondary health-note">${this._escape(r.notes.join('；'))}</div>` : ''}
+          ${r.detail ? `<div class="health-detail mono" title="${this._escape(r.detail)}">${this._escape(r.detail)}</div>` : ''}
+        </td>
+        <td class="mono health-quota">
+          ${r.quota ? `C ${fmtQ(r.quota.claudeWeekly)} / G ${fmtQ(r.quota.geminiWeekly)}` : '-'}
+        </td>
+        <td class="mono">${typeof r.probeLatencyMs === 'number' ? `${r.probeLatencyMs}ms` : '-'}</td>
+      </tr>
+    `).join('');
+    return `
+      <details class="quota-section health-section" ${open ? 'open' : ''}>
+        <summary class="quota-section-heading">${this._escape(title)}（${rows.length}）</summary>
+        <div class="table-wrapper">
+          <table class="table">
+            <thead><tr><th>ID</th><th>邮箱</th><th>结论</th><th>周额度 Claude/Gemini</th><th>测试耗时</th></tr></thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>
+      </details>
     `;
   }
 
@@ -195,6 +309,25 @@ export class AccountsPage extends Component {
     `;
   }
 
+  /** 「用完再换」模式下，显示 Claude / Gemini 各自当前在用的账号 */
+  _renderStickyBanner(strategy, accounts) {
+    if (strategy !== 'sticky') return '';
+    const sticky = store.get('accounts.stickyAccounts') || {};
+    const label = { claude: 'Claude / GPT', gemini: 'Gemini' };
+    const items = ['claude', 'gemini'].map(family => {
+      const cur = sticky[family];
+      const email = cur ? (accounts.find(a => a.id === cur.id)?.email || cur.email || `id=${cur.id}`) : null;
+      return `<span class="sticky-item">${label[family]}：<b>${email ? this._escape(email) : '下一次请求时选定'}</b></span>`;
+    }).join('');
+    return `
+      <div class="card mb-4 pinned-banner sticky-banner">
+        <div class="pinned-banner-text">
+          🔒 用完再换：一直用当前号，额度用完或失效后按顺序换下一个。${items}
+        </div>
+      </div>
+    `;
+  }
+
   _calcStats(accounts) {
     return {
       total: accounts.length,
@@ -236,7 +369,34 @@ export class AccountsPage extends Component {
       `;
     }
 
+    // 单号检测结果优先；没有时用最近一次批量检测结果（弹窗打开过才有）
+    const single = store.get('accounts.health') || {};
+    const checking = store.get('accounts.healthChecking') || {};
+    const batch = {};
+    for (const r of store.get('dialogs.health.job')?.results || []) batch[r.id] = r;
+    this._rowHealth = { single, checking, batch };
+
     return accounts.map(a => this._renderAccountRow(a, selectedIds)).join('');
+  }
+
+  /** 「用完再换」模式下，在当前在用账号的邮箱旁标注它服务的额度分组 */
+  _renderStickyTags(a) {
+    if (store.get('accounts.strategy') !== 'sticky' || store.get('accounts.pinned')) return '';
+    const sticky = store.get('accounts.stickyAccounts') || {};
+    const tags = [];
+    if (sticky.claude?.id === a.id) tags.push('Claude 在用');
+    if (sticky.gemini?.id === a.id) tags.push('Gemini 在用');
+    return tags.map(t => `<span class="badge sticky-tag">🔒 ${t}</span>`).join('');
+  }
+
+  /** 状态列下方的最近一次检测结论 */
+  _renderRowHealth(a) {
+    const { single = {}, batch = {} } = this._rowHealth || {};
+    const r = single[a.id] || batch[a.id];
+    if (!r) return '';
+    const text = { ok: '检测正常', warn: '检测警告', fail: '检测不通过' }[r.level] || '';
+    const tip = [r.message, ...(r.notes || []), r.detail].filter(Boolean).join('\n');
+    return `<div class="row-health health-msg-${r.level}" title="${this._escape(tip)}">🩺 ${text}</div>`;
   }
 
   _renderAccountRow(a, selectedIds) {
@@ -293,6 +453,7 @@ export class AccountsPage extends Component {
         <td>
           <div class="account-email-cell">
             <span class="account-email">${this._escape(a.email)}</span>
+            ${this._renderStickyTags(a)}
           </div>
         </td>
         <td>
@@ -303,6 +464,7 @@ export class AccountsPage extends Component {
         </td>
         <td>
           <span class="status-indicator ${statusClass}">${statusText}</span>
+          ${this._renderRowHealth(a)}
         </td>
         <td class="mono" style="font-size:12px">
           ${formatTime(a.last_used_at)}
@@ -312,6 +474,9 @@ export class AccountsPage extends Component {
             ${isPinned
               ? `<button class="btn btn-sm btn-icon btn-pinned" title="已指定（点击取消）" data-cmd="accounts:unpin" data-id="${a.id}">📌</button>`
               : `<button class="btn btn-sm btn-icon" title="指定只用此账号" data-cmd="accounts:pin" data-id="${a.id}" data-email="${this._escape(a.email)}">📍</button>`}
+            ${this._rowHealth?.checking?.[a.id]
+              ? `<button class="btn btn-sm btn-icon" title="正在检测" disabled><span class="spinner"></span></button>`
+              : `<button class="btn btn-sm btn-icon" title="测试连通性（刷新 token、同步额度并发一条测试请求）" data-cmd="health:check-one" data-id="${a.id}" data-email="${this._escape(a.email)}">🩺</button>`}
             <button class="btn btn-sm btn-icon" title="配额详情" data-cmd="accounts:view-quota" data-id="${a.id}">
               📊
             </button>
@@ -707,11 +872,11 @@ export class AccountsPage extends Component {
   }
 
   onMount() {
-    this.watch(['accounts', 'dialogs.oauth', 'dialogs.quota', 'dialogs.import']);
+    this.watch(['accounts', 'dialogs.oauth', 'dialogs.quota', 'dialogs.import', 'dialogs.health']);
     // 每 5 秒只拉一次设置：后端额度用完自动换号后，横幅与 📌 及时跟上（变化时才整表刷新）
     this._autoRefreshTimer = setInterval(() => {
       if (document.hidden) return;
-      if (!store.get('accounts.pinned')) return;
+      if (!store.get('accounts.pinned') && store.get('accounts.strategy') !== 'sticky') return;
       commands.dispatch('accounts:sync-pinned').catch(() => {});
     }, 5000);
   }
@@ -725,6 +890,7 @@ export class AccountsPage extends Component {
     this._syncDialogState('oauthDialog', store.get('dialogs.oauth.open'));
     this._syncDialogState('quotaDialog', store.get('dialogs.quota.open'));
     this._syncDialogState('importDialog', store.get('dialogs.import.open'));
+    this._syncDialogState('healthDialog', store.get('dialogs.health.open'));
   }
 
   _syncDialogState(dialogId, shouldBeOpen) {
@@ -758,6 +924,11 @@ export class AccountsPage extends Component {
       const saved = localStorage.getItem('accounts.sortBy');
       if (saved && store.get('accounts.sortBy') === undefined) store.set('accounts.sortBy', saved);
     } catch { /* ignore */ }
+
+    // 全局选号策略
+    this.delegate('change', '[data-action="strategy"]', (e, target) => {
+      commands.dispatch('accounts:set-strategy', { strategy: target.value });
+    });
 
     // 排序方式（记住选择）
     this.delegate('change', '[data-action="sort"]', (e, target) => {
@@ -815,6 +986,11 @@ export class AccountsPage extends Component {
         ta.remove();
         ok ? toast.success('Refresh Token 已复制') : toast.error('复制失败，请点「显示」后手动复制');
       }
+    });
+
+    this.on('[data-action="health-start"]', 'click', () => {
+      const probe = this.container.querySelector('#healthProbe')?.checked !== false;
+      commands.dispatch('health:start', { probe });
     });
 
     this.delegate('click', '[data-action="import-tab"]', (e, target) => {
@@ -880,6 +1056,8 @@ export class AccountsPage extends Component {
           commands.dispatch('accounts:close-quota');
         } else if (dialogId === 'importDialog') {
           commands.dispatch('import:close');
+        } else if (dialogId === 'healthDialog') {
+          commands.dispatch('health:close');
         }
       }
     });
@@ -893,6 +1071,8 @@ export class AccountsPage extends Component {
         commands.dispatch('accounts:close-quota');
       } else if (dialogId === 'importDialog') {
         commands.dispatch('import:close');
+      } else if (dialogId === 'healthDialog') {
+        commands.dispatch('health:close');
       }
     });
   }

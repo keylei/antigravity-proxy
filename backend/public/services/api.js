@@ -252,6 +252,14 @@ class ApiService {
     return this.request('/admin/settings');
   }
 
+  /** 全局选号策略：'round-robin' 每次换号 / 'sticky' 用完再换 */
+  async setPoolStrategy(strategy) {
+    return this.request('/admin/pool-strategy', {
+      method: 'PUT',
+      body: { strategy }
+    });
+  }
+
   /** 指定所有请求固定使用某个账号；id=null 取消指定 */
   async setPinnedAccount(id, strict = true) {
     return this.request('/admin/pinned-account', {
@@ -285,6 +293,28 @@ async createAccount(email, refreshToken, projectId = null) {
     return this.request('/admin/accounts/refresh-all', {
       method: 'POST',
       body: {}
+    });
+  }
+
+  /** 启动一键健康检测（后台运行），probe=true 时每个号额外发一条极小测试请求 */
+  async startHealthCheck(probe = true) {
+    return this.request('/admin/accounts/health-check', {
+      method: 'POST',
+      body: { probe }
+    });
+  }
+
+  /** 同步检测单个账号，直接返回结果 */
+  async checkAccountHealth(id, probe = true) {
+    return this.request(`/admin/accounts/${encodeURIComponent(id)}/health-check`, {
+      method: 'POST',
+      body: { probe }
+    });
+  }
+
+  async getHealthCheck() {
+    return this.request('/admin/accounts/health-check', {
+      dedupKey: 'health-check'
     });
   }
 

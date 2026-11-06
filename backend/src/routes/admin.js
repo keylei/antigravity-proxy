@@ -8,7 +8,8 @@ import {
     getSetting, setSetting
 } from '../db/index.js';
 import { initializeAccount, refreshAccessToken, fetchProjectId, fetchQuotaInfo, fetchDetailedQuotaInfo } from '../services/tokenManager.js';
-import { accountPool, getPinnedAccountSetting } from '../services/accountPool.js';
+import { accountPool, getPinnedAccountSetting, getPoolStrategy, POOL_STRATEGIES } from '../services/accountPool.js';
+import { startHealthCheck, getHealthCheckStatus, checkSingleAccount } from '../services/healthCheck.js';
 
 // 仪表盘「今日」统计的时区偏移（分钟）
 // 例如中国时间（UTC+8）可设置为 480，默认使用服务器本地时间（0 表示不偏移）
@@ -29,6 +30,16 @@ function groupStoredQuotaBuckets(rows) {
         });
     }
     return [...groups.values()];
+}
+
+/** 「用完再换」模式下各额度分组当前在用的账号：{ claude: { id, email }, gemini: { id, email } } */
+function describeStickyAccounts() {
+    const out = {};
+    for (const [family, id] of Object.entries(accountPool.getStickyAccounts())) {
+        const account = getAccountById(Number(id));
+        out[family] = { id: Number(id), email: account?.email || null };
+    }
+    return out;
 }
 
 function parseCredits(raw) {
@@ -364,6 +375,27 @@ export default async function adminRoutes(fastify) {
         };
     });
 
+    // POST /admin/accounts/health-check  body: { probe?: boolean, probeModel?: string }
+    // 后台启动一键健康检测，立即返回任务进度；已有任务在跑时返回该任务
+    fastify.post('/admin/accounts/health-check', async (request) => {
+        const { probe = true, probeModel } = request.body || {};
+        return { success: true, job: startHealthCheck({ probe, probeModel }) };
+    });
+
+    // POST /admin/accounts/:id/health-check  body: { probe?: boolean }
+    // 同步检测单个账号，直接返回结果（约 3~10 秒）
+    fastify.post('/admin/accounts/:id/health-check', async (request, reply) => {
+        const { probe = true } = request.body || {};
+        const result = await checkSingleAccount(request.params.id, { probe });
+        if (!result) return reply.code(404).send({ error: { message: 'Account not found' } });
+        return { success: true, result };
+    });
+
+    // GET /admin/accounts/health-check  当前或最近一次检测的进度与结果
+    fastify.get('/admin/accounts/health-check', async () => {
+        return { success: true, job: getHealthCheckStatus() };
+    });
+
     // ==================== 请求日志 ====================
 
     // GET /admin/logs
@@ -420,9 +452,21 @@ export default async function adminRoutes(fastify) {
     fastify.get('/admin/settings', async () => {
         return {
             defaultModel: getSetting('defaultModel', 'gemini-2.5-flash'),
-            pollingStrategy: getSetting('pollingStrategy', 'weighted'),
+            pollingStrategy: getPoolStrategy(),
+            stickyAccounts: describeStickyAccounts(),
             pinnedAccount: getPinnedAccountSetting()
         };
+    });
+
+    // PUT /admin/pool-strategy  body: { strategy: 'round-robin' | 'sticky' }
+    // 全局选号策略：每次请求换号 / 一个号用完额度再换下一个
+    fastify.put('/admin/pool-strategy', async (request, reply) => {
+        const { strategy } = request.body || {};
+        if (!POOL_STRATEGIES.includes(strategy)) {
+            return reply.code(400).send({ error: { message: `strategy 只能是 ${POOL_STRATEGIES.join(' / ')}` } });
+        }
+        setSetting('pollingStrategy', strategy);
+        return { success: true, pollingStrategy: strategy, stickyAccounts: describeStickyAccounts() };
     });
 
     // PUT /admin/pinned-account  body: { id: number|null, strict?: boolean }

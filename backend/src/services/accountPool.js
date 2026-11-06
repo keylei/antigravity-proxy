@@ -22,6 +22,18 @@ export function getPinnedAccountSetting() {
 }
 
 /**
+ * 全局选号策略（settings.pollingStrategy）
+ *  - round-robin：每次请求按账号 ID 换下一个号，额度平均消耗
+ *  - sticky：一直用当前号，直到它额度用完 / 失效，再按 ID 轮到下一个号
+ * 指定账号（📍）优先级高于选号策略。旧值 'weighted' 从未生效，按 round-robin 处理。
+ */
+export const POOL_STRATEGIES = ['round-robin', 'sticky'];
+
+export function getPoolStrategy() {
+    return getSetting('pollingStrategy', 'round-robin') === 'sticky' ? 'sticky' : 'round-robin';
+}
+
+/**
  * 解析上游「个人额度用完」错误里的重置时间，如
  * "Individual quota reached ... Resets in 136h22m15s." → 毫秒
  */
@@ -259,6 +271,10 @@ class AccountPool {
         let earliestCooldownUntil = null;
         let cooldownCount = 0;
 
+        if (getPoolStrategy() === 'sticky') {
+            return this._getStickyAccount(accounts, mappedModel, excludeIds);
+        }
+
         // 严格轮询：按 ID 排序，保证稳定顺序
         const ordered = [...accounts].sort((a, b) => (a.id || 0) - (b.id || 0));
         const total = ordered.length;
@@ -337,6 +353,86 @@ class AccountPool {
             const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
             const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
             const messageSeconds = Math.max(0, seconds - 1);
+            const err = new Error(`No capacity available, reset after ${messageSeconds}s`);
+            err.upstreamStatus = 429;
+            err.retryAfterMs = remainingMs;
+            throw err;
+        }
+
+        throw new Error('No available accounts with valid tokens');
+    }
+
+    getStrategy() {
+        return getPoolStrategy();
+    }
+
+    /** sticky 模式下每个额度分组（claude / gemini）当前在用的账号：{ claude: id, gemini: id } */
+    getStickyAccounts() {
+        const raw = getSetting('stickyAccounts', null);
+        return raw && typeof raw === 'object' ? raw : {};
+    }
+
+    _setStickyAccount(family, account, mappedModel) {
+        const current = this.getStickyAccounts();
+        if (Number(current[family]) === account.id) return;
+        const prevId = current[family] ?? null;
+        setSetting('stickyAccounts', { ...current, [family]: account.id });
+        console.log(`[ACCOUNT_POOL] sticky ${family}: ${prevId ?? '-'} -> ${account.id} (${account.email}) model=${mappedModel}`);
+    }
+
+    /**
+     * sticky 选号：先用该额度分组的「当前号」；它额度用完或失效（已不在可用列表里）时，
+     * 按账号 ID 轮到下一个号并把它设为新的当前号。
+     * 本次请求临时排除（重试换号）或短暂冷却不会改变当前号，下一次请求仍回到它。
+     */
+    async _getStickyAccount(accounts, mappedModel, excludeIds) {
+        const family = quotaFamily(mappedModel) || mappedModel || 'default';
+        const ordered = [...accounts].sort((a, b) => (a.id || 0) - (b.id || 0));
+        const total = ordered.length;
+        const stickyId = Number(this.getStickyAccounts()[family]) || 0;
+        const stickyUsable = ordered.some(a => a.id === stickyId);
+
+        let startIdx = stickyUsable
+            ? ordered.findIndex(a => a.id === stickyId)
+            : ordered.findIndex(a => a.id > stickyId);
+        if (startIdx === -1) startIdx = 0;
+
+        let earliestCooldownUntil = null;
+        let cooldownCount = 0;
+
+        for (let offset = 0; offset < total; offset++) {
+            const account = ordered[(startIdx + offset) % total];
+            if (excludeIds.has(account.id)) continue;
+
+            if (!DISABLE_LOCAL_LIMITS && Number.isFinite(MAX_CONCURRENT_PER_ACCOUNT) && MAX_CONCURRENT_PER_ACCOUNT > 0) {
+                const lockCount = this.accountLocks.get(account.id) || 0;
+                if (lockCount >= MAX_CONCURRENT_PER_ACCOUNT) continue;
+            }
+
+            if (!DISABLE_LOCAL_LIMITS && mappedModel && this.isAccountInCooldown(account.id, mappedModel)) {
+                cooldownCount += 1;
+                const until = this.capacityCooldowns.get(`${account.id}:${mappedModel}`);
+                if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
+                    earliestCooldownUntil = until;
+                }
+                continue;
+            }
+
+            try {
+                const validAccount = await ensureValidToken(account);
+                this.lockAccount(account.id);
+                updateAccountLastUsed(account.id);
+                this.lastUsedAccountId = account.id;
+                if (!stickyUsable) this._setStickyAccount(family, account, mappedModel);
+                return validAccount;
+            } catch (err) {
+                console.error(`[ACCOUNT_POOL] sticky ensureValidToken failed for account ${account.id} (${account.email}):`, err.message);
+            }
+        }
+
+        if (!DISABLE_LOCAL_LIMITS && mappedModel && cooldownCount === total && earliestCooldownUntil) {
+            const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
+            const messageSeconds = Math.max(0, Math.ceil(remainingMs / 1000) - 1);
             const err = new Error(`No capacity available, reset after ${messageSeconds}s`);
             err.upstreamStatus = 429;
             err.retryAfterMs = remainingMs;
